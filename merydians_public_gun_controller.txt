@@ -26,7 +26,8 @@ LastLock = 0
 LastLockClick = -1
 
 local function liveInput(name, fallback)
-    local value = wire.ports[name]
+    local input = Inputs[name]
+    local value = input and input:get() or InputValues[name]
     if value ~= nil then return value end
     return fallback
 end
