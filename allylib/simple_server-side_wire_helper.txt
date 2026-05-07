@@ -21,9 +21,11 @@ Function index:
 - `addInputTrigger(name, fn)`: adds an input trigger without touching `Inputs` directly.
 - `safeWireCreate(entI, entO, inputName, outputName)`: protected `wire.create`.
 - `safeWireDelete(ent, inputName)`: protected `wire.delete`.
+- `updateWirelinkField(wirelink, field, value, slot)`: cached wirelink field write.
 - `addDriverDetection(vehicleOrInput, fn, interval)`: polls a chair/entity input for its driver.
 - `minSendTime(...)`: returns the helper's current send interval estimate.
 - `networkTargetSet(target)`: sets explicit NetVar recipients; nil means `net.send(nil)`.
+- `enableConnectSend(enabled)`: only sends NetVars to clients that have run the helper HUD hook once.
 - `networkEnableDebug(enabled)`: toggles helper debug state.
 - `networkStats()`: returns simple replication counters.
 - `updateMaxSend(...)`: compatibility no-op in the simplified helper.
@@ -34,18 +36,21 @@ Function index:
 - `Outputs.<Name>:update(value)`: cached output write.
 - `NetVars.<Name>:get(fallback)`: reads replicated value with a valid default.
 - `NetVars.<Name>:addTrigger(fn)`: runs when a replicated value changes.
-- `NetVars.<Name>:update(value)`: updates a custom NetVar on the server.
+- `NetVars.<Name>:update(value, interval)`: updates a custom NetVar on the server.
 - `NetVars.<Name>:setInterval(interval)`: caps that NetVar's send interval.
 - `addNetworkedVariable(name, interval)`: registers a custom NetVar.
+- `addNetworkedVariables(names, interval)`: registers several custom NetVars.
 - `updateNetworkedVariable(name, value, interval)`: queues latest value for replication.
+- `updateNetworkedVariables(values, interval)`: queues several latest values for replication.
 - `State.<Prefix>`: reads a replicated gun or prop armor state table with valid defaults.
+- `addStateSend(prefix, interval, ...)`: registers custom entity method state vars.
 - `addNetworkedGunState(prefix, interval)`: registers common ACF gun state vars.
 - `updateNetworkedGunState(prefix, inputOrGun, interval)`: queues common ACF gun state.
 - `addNetworkedPropArmorState(prefix, interval)`: registers common prop armor state.
 - `updateNetworkedPropArmorState(prefix, inputOrProp, interval)`: queues prop armor state.
 ]]--
 
--- Version 2.0.0
+-- Version 2.1.0
 
 Inputs, Outputs, InputValues = Inputs or {}, Outputs or {}, InputValues or {}
 InputValidity = InputValidity or {}
@@ -53,6 +58,7 @@ InputTriggers = InputTriggers or {}
 Input = Inputs
 
 NetVars = NetVars or {}
+NetworkedVariables = NetVars
 NetVarValues = NetVarValues or {}
 NetValues = NetVarValues
 NetworkedVariableTriggers = NetworkedVariableTriggers or {}
@@ -65,17 +71,34 @@ StateKinds = StateKinds or {}
 NetworkedStatePollers = NetworkedStatePollers or {}
 NetworkedStateStatic = NetworkedStateStatic or {}
 NetworkedStateNames = NetworkedStateNames or {}
+NetworkedStateFields = NetworkedStateFields or {}
+ConnectSendTargets = ConnectSendTargets or {}
+ConnectSendEnabled = ConnectSendEnabled or false
 
 NetworkFlushInterval = NetworkFlushInterval or 0.05
 NetworkMaxRecordsPerFlush = NetworkMaxRecordsPerFlush or 64
+
+local NETWORK_BUDGET_DIVISOR = 3
+local NETWORK_BURST_RATE_BITS = 5 * 1024 * 8
+local NETWORK_BURST_MAX_BITS = 10 * 1024 * 8
+local NETWORK_SEND_RATE_BITS = NETWORK_BURST_RATE_BITS / NETWORK_BUDGET_DIVISOR
+local NETWORK_SEND_BURST_BITS = NETWORK_BURST_MAX_BITS / NETWORK_BUDGET_DIVISOR
+local NETWORK_PACKET_BITS = NETWORK_SEND_BURST_BITS
+local NETWORK_PACKET_OVERHEAD_BITS = 64
+local NETWORK_RECORD_COUNT_BITS = 16
+local NETWORK_RECORD_OVERHEAD_BITS = 8
+local NETWORK_STRING_OVERHEAD_BITS = 8
 
 local NET_MESSAGE = "SSSWH_" .. chip():entIndex() .. "_NetVars"
 local CurTime = timer.curtime
 local LastOutputValues = LastOutputValues or {}
 local ChangedSlots = ChangedSlots or {}
+local NetworkSendBudgetBits = NetworkSendBudgetBits or NETWORK_SEND_BURST_BITS
+local NetworkLastBudgetTime = NetworkLastBudgetTime or CurTime()
 local DriverHookInstalled = false
 
 _G.NetVars = NetVars
+_G.NetworkedVariables = NetVars
 _G.NetVarValues = NetVarValues
 _G.NetValues = NetValues
 _G.State = State
@@ -263,6 +286,21 @@ if getmetatable(NetVars) == nil then
     })
 end
 
+if getmetatable(NetVarValues) == nil then
+    setmetatable(NetVarValues, {
+        __index = function(_, key)
+            if type(key) ~= "string" then return nil end
+
+            local entry = rawget(NetVars, key)
+            if entry and entry.typeCode ~= nil then
+                return defaultForTypeCode(entry.typeCode)
+            end
+
+            return defaultNetVarValue(key)
+        end
+    })
+end
+
 function netVarProto:get(fallback)
     local value = NetVarValues[self.name]
     if value ~= nil then return value end
@@ -298,9 +336,9 @@ function netVarProto:resetChanged(slot)
     return resetChanged(slot or ("__netvar:" .. self.name))
 end
 
-function netVarProto:update(value)
+function netVarProto:update(value, interval)
     if not SERVER then return false end
-    return updateNetworkedVariable(self.name, value)
+    return updateNetworkedVariable(self.name, value, interval)
 end
 
 function netVarProto:setInterval(interval)
@@ -416,6 +454,16 @@ function resetChanged(slot)
     end
 end
 
+function updateWirelinkField(wirelink, field, value, slot)
+    if wirelink == nil or field == nil then return false end
+
+    local changeSlot = slot or ("__wirelink:" .. tostring(wirelink) .. ":" .. tostring(field))
+    if not changed(value, true, changeSlot) then return false end
+
+    wirelink[field] = value
+    return true
+end
+
 function getNetworkedVariableValue(name, fallback)
     return NetVars[name]:get(fallback)
 end
@@ -442,8 +490,11 @@ local StateFieldDefaults = {
     AmmoCount = 0,
     AmmoCountMax = 0,
     MagSize = 0,
+    MagRounds = 0,
     Armor = 0,
-    ArmorMax = 0
+    ArmorMax = 0,
+    PropArmor = 0,
+    PropArmorMax = 0
 }
 
 local function stateNames(prefix)
@@ -461,7 +512,9 @@ local function stateNames(prefix)
         AmmoCountMax = prefix .. "AmmoCountMax",
         MagSize = prefix .. "MagSize",
         Armor = prefix .. "Armor",
-        ArmorMax = prefix .. "ArmorMax"
+        ArmorMax = prefix .. "ArmorMax",
+        PropArmor = prefix .. "PropArmor",
+        PropArmorMax = prefix .. "PropArmorMax"
     }
     NetworkedStateNames[prefix] = names
     return names
@@ -477,8 +530,11 @@ local StateFieldSuffixes = {
     AmmoCount = "AmmoCount",
     AmmoCountMax = "AmmoCountMax",
     MagSize = "MagSize",
+    MagRounds = "MagRounds",
     Armor = "Armor",
     ArmorMax = "ArmorMax",
+    PropArmor = "PropArmor",
+    PropArmorMax = "PropArmorMax",
     name = "Name",
     ready = "Ready",
     reloadTime = "ReloadTime",
@@ -488,8 +544,11 @@ local StateFieldSuffixes = {
     ammoCount = "AmmoCount",
     ammoCountMax = "AmmoCountMax",
     magSize = "MagSize",
+    magRounds = "MagRounds",
     armor = "Armor",
-    armorMax = "ArmorMax"
+    armorMax = "ArmorMax",
+    propArmor = "PropArmor",
+    propArmorMax = "PropArmorMax"
 }
 
 local StateProto = {}
@@ -497,7 +556,7 @@ StateProto.__index = function(self, key)
     local suffix = StateFieldSuffixes[key]
     if suffix == nil then return nil end
 
-    local value = NetVarValues[self.__names[suffix]]
+    local value = NetVarValues[self.__names[suffix] or (self.__prefix .. suffix)]
     if value ~= nil then return value end
     return StateFieldDefaults[suffix]
 end
@@ -522,6 +581,19 @@ function networkTargetSet(target)
     NetworkTargets = target or nil
     return true
 end
+
+function enableConnectSend(enabled)
+    ConnectSendEnabled = enabled == true
+
+    if SERVER then
+        if not ConnectSendEnabled then ConnectSendTargets = {} end
+    elseif CLIENT then
+        if not ConnectSendEnabled then return false end
+    end
+
+    return ConnectSendEnabled
+end
+_G.enableConnectSend = enableConnectSend
 
 function networkEnableDebug(enabled)
     NetworkDebugEnabled = enabled == true
@@ -658,6 +730,7 @@ if SERVER then
     local DirtyLookup = DirtyLookup or {}
     local NextFlush = 0
     local NextStatePoll = 0
+    local PendingRecords = PendingRecords or {}
 
     local function markDirty(entry)
         if DirtyLookup[entry.name] then return end
@@ -671,6 +744,18 @@ if SERVER then
         entry.enabled = true
         if interval ~= nil then entry.interval = tonumber(interval) or 0 end
         return entry
+    end
+
+    function addNetworkedVariables(names, interval)
+        if type(names) ~= "table" then return 0 end
+
+        local count = 0
+        for i = 1, #names do
+            if addNetworkedVariable(names[i], interval) then
+                count = count + 1
+            end
+        end
+        return count
     end
 
     function setNetworkedVariableInterval(name, interval)
@@ -699,6 +784,18 @@ if SERVER then
         return true
     end
 
+    function updateNetworkedVariables(values, interval)
+        if type(values) ~= "table" then return 0 end
+
+        local count = 0
+        for name, value in pairs(values) do
+            if updateNetworkedVariable(name, value, interval) then
+                count = count + 1
+            end
+        end
+        return count
+    end
+
     local TYPE_NIL = 0
     local TYPE_BOOL = 1
     local TYPE_NUMBER = 2
@@ -708,6 +805,12 @@ if SERVER then
     local TYPE_ENTITY = 6
     local TYPE_ARRAY = 7
     local TYPE_MAP = 8
+
+    local estimateValueBits
+
+    local function estimateStringBits(value)
+        return (string.len(tostring(value or "")) + 1) * 8 + NETWORK_STRING_OVERHEAD_BITS
+    end
 
     local function valueTypeCode(value)
         if value == nil then return TYPE_NIL end
@@ -728,6 +831,54 @@ if SERVER then
             if value[i] == nil then return TYPE_MAP end
         end
         return TYPE_ARRAY
+    end
+
+    estimateValueBits = function(value)
+        local code = valueTypeCode(value)
+        local bits = 4
+
+        if code == TYPE_NIL then
+            return bits
+        elseif code == TYPE_BOOL then
+            return bits + 1
+        elseif code == TYPE_NUMBER then
+            return bits + 64
+        elseif code == TYPE_STRING then
+            return bits + estimateStringBits(value)
+        elseif code == TYPE_VECTOR or code == TYPE_ANGLE then
+            return bits + 96
+        elseif code == TYPE_ENTITY then
+            return bits + 16
+        elseif code == TYPE_ARRAY then
+            bits = bits + 16
+            for i = 1, #value do
+                bits = bits + estimateValueBits(value[i])
+            end
+            return bits
+        elseif code == TYPE_MAP then
+            bits = bits + 16
+            for k, v in pairs(value) do
+                bits = bits + estimateValueBits(k) + estimateValueBits(v)
+            end
+            return bits
+        end
+
+        return bits + estimateStringBits(value)
+    end
+
+    local function estimateRecordBits(record)
+        return estimateStringBits(record[1]) + estimateValueBits(record[2]) + NETWORK_RECORD_OVERHEAD_BITS
+    end
+
+    local function refillNetworkBudget()
+        local now = CurTime()
+        local elapsed = math.max(0, now - NetworkLastBudgetTime)
+
+        NetworkLastBudgetTime = now
+        NetworkSendBudgetBits = math.min(
+            NETWORK_SEND_BURST_BITS,
+            NetworkSendBudgetBits + elapsed * NETWORK_SEND_RATE_BITS
+        )
     end
 
     local function writeValue(value)
@@ -768,42 +919,133 @@ if SERVER then
         return ok and valid == true
     end
 
-    local function sendToTargets()
+    local function connectSendTargets()
+        local targets = {}
+        for target in pairs(ConnectSendTargets) do
+            if validRecipient(target) then
+                targets[#targets + 1] = target
+            else
+                ConnectSendTargets[target] = nil
+            end
+        end
+        return targets
+    end
+
+    local function targetAllowedByConnectSend(target)
+        if not ConnectSendEnabled then return true end
+        return ConnectSendTargets[target] == true
+    end
+
+    local function resolveSendTargets(targetOverride)
+        if targetOverride ~= nil then
+            if not validRecipient(targetOverride) or not targetAllowedByConnectSend(targetOverride) then return false, nil end
+            return true, targetOverride
+        end
+
         if NetworkTargets == nil or NetworkTargets == false then
-            net.send(nil)
-            return true
+            if ConnectSendEnabled then
+                local targets = connectSendTargets()
+                if #targets <= 0 then return false, nil end
+                return true, targets
+            end
+
+            return true, nil
         end
 
         if type(NetworkTargets) ~= "table" then
-            if not validRecipient(NetworkTargets) then return false end
-            net.send(NetworkTargets)
-            return true
+            if not validRecipient(NetworkTargets) or not targetAllowedByConnectSend(NetworkTargets) then return false, nil end
+            return true, NetworkTargets
         end
 
         local targets = {}
         for _, target in pairs(NetworkTargets) do
-            if validRecipient(target) then
+            if validRecipient(target) and targetAllowedByConnectSend(target) then
                 targets[#targets + 1] = target
             end
         end
 
-        if #targets <= 0 then return false end
-        net.send(targets)
+        if #targets <= 0 then return false, nil end
+        return true, targets
+    end
+
+    local function sendRecords(records, targetOverride)
+        if #records <= 0 then return true end
+
+        local packetRecords = {}
+        local packetBits = NETWORK_PACKET_OVERHEAD_BITS + NETWORK_RECORD_COUNT_BITS
+
+        for i = 1, #records do
+            local record = records[i]
+            local recordBits = estimateRecordBits(record)
+            local wouldOverflow = #packetRecords > 0 and packetBits + recordBits > NETWORK_PACKET_BITS
+
+            if wouldOverflow then
+                PendingRecords[#PendingRecords + 1] = {
+                    records = packetRecords,
+                    target = targetOverride,
+                    bits = packetBits
+                }
+
+                packetRecords = {}
+                packetBits = NETWORK_PACKET_OVERHEAD_BITS + NETWORK_RECORD_COUNT_BITS
+            end
+
+            packetRecords[#packetRecords + 1] = record
+            packetBits = packetBits + recordBits
+        end
+
+        if #packetRecords > 0 then
+            PendingRecords[#PendingRecords + 1] = {
+                records = packetRecords,
+                target = targetOverride,
+                bits = packetBits
+            }
+        end
+
         return true
     end
 
-    local function sendRecords(records)
-        if #records <= 0 then return end
-        networkDebug("sending records count=", #records, " target=", NetworkTargets)
-        net.start(NET_MESSAGE)
-        net.writeUInt(#records, 16)
-        for i = 1, #records do
-            net.writeString(records[i][1])
-            writeValue(records[i][2])
+    local function sendPendingRecords()
+        local packet = PendingRecords[1]
+        if not packet then return end
+
+        refillNetworkBudget()
+        local packetBits = packet.bits or NETWORK_PACKET_BITS
+        if packetBits > NetworkSendBudgetBits then
+            NetworkReplicationStats.packetsDeferred = (NetworkReplicationStats.packetsDeferred or 0) + 1
+            return
         end
-        if not sendToTargets() then return end
+
+        local canSend, targets = resolveSendTargets(packet.target)
+        if not canSend then
+            table.remove(PendingRecords, 1)
+            return
+        end
+
+        networkDebug("sending records count=", #packet.records, " target=", NetworkTargets)
+        local ok, err = xpcall(function()
+            net.start(NET_MESSAGE)
+            net.writeUInt(#packet.records, 16)
+            for i = 1, #packet.records do
+                net.writeString(packet.records[i][1])
+                writeValue(packet.records[i][2])
+            end
+            net.send(targets)
+        end, function(e) return e end)
+
+        if not ok then
+            NetworkSendBudgetBits = 0
+            NetworkReplicationStats.sendErrors = (NetworkReplicationStats.sendErrors or 0) + 1
+            NetworkReplicationStats.lastSendError = tostring(err)
+            return
+        end
+
+        table.remove(PendingRecords, 1)
+        NetworkSendBudgetBits = math.max(0, NetworkSendBudgetBits - packetBits)
         NetworkReplicationStats.packetsSent = (NetworkReplicationStats.packetsSent or 0) + 1
-        NetworkReplicationStats.variablesSent = (NetworkReplicationStats.variablesSent or 0) + #records
+        NetworkReplicationStats.variablesSent = (NetworkReplicationStats.variablesSent or 0) + #packet.records
+        NetworkReplicationStats.pendingPackets = #PendingRecords
+        NetworkReplicationStats.sendBudgetBits = NetworkSendBudgetBits
     end
 
     local function flush(force)
@@ -839,6 +1081,52 @@ if SERVER then
         return NetVars[name]:addTrigger(fn)
     end
 
+    local function normalizeStatePrefix(prefix)
+        if type(prefix) == "number" then return "State" .. prefix end
+        if type(prefix) == "string" and prefix ~= "" then return prefix end
+        return "State"
+    end
+
+    local function stateFieldSuffix(prefix, methodName, explicitName)
+        if type(explicitName) == "string" and explicitName ~= "" then return explicitName end
+        local suffix = tostring(methodName or "")
+        suffix = string.gsub(suffix, "^acf", "")
+        if string.sub(suffix, 1, #prefix) == prefix then suffix = string.sub(suffix, #prefix + 1) end
+        if suffix == "" then suffix = tostring(methodName or "Value") end
+        return suffix
+    end
+
+    local function addStateField(prefix, spec, index)
+        local methodName, fieldName, fallback
+
+        if type(spec) == "string" then
+            methodName = spec
+        elseif type(spec) == "function" then
+            methodName = "Value" .. tostring(index or 1)
+        elseif type(spec) == "table" then
+            methodName = spec.method or spec[1] or spec.name
+            fieldName = spec.field or spec[2]
+            fallback = spec.fallback
+            if fallback == nil then fallback = spec.default end
+            if fallback == nil then fallback = spec[3] end
+        end
+
+        if type(methodName) ~= "string" or methodName == "" then return nil end
+        local suffix = stateFieldSuffix(prefix, methodName, fieldName)
+        if fallback == nil then fallback = 0 end
+        local field = {
+            name = prefix .. suffix,
+            method = methodName,
+            fallback = fallback,
+            fn = type(spec) == "function" and spec or type(spec) == "table" and spec.fn or nil
+        }
+        addNetworkedVariable(field.name, 0)
+        StateFieldDefaults[suffix] = field.fallback
+        StateFieldSuffixes[suffix] = suffix
+        StateFieldSuffixes[string.sub(suffix, 1, 1):lower() .. string.sub(suffix, 2)] = suffix
+        return field
+    end
+
     local function addStatePoller(kind, prefix, interval)
         local existing = NetworkedStatePollers[prefix]
         local names = stateNames(prefix)
@@ -850,6 +1138,21 @@ if SERVER then
             nextUpdate = existing and existing.nextUpdate or 0
         }
         NextStatePoll = 0
+    end
+
+    function addStateSend(prefix, interval, ...)
+        prefix = normalizeStatePrefix(prefix)
+        local count = select("#", ...)
+        local fields = {}
+        for i = 1, count do
+            local field = addStateField(prefix, select(i, ...), i)
+            if field then fields[#fields + 1] = field end
+        end
+        if #fields <= 0 then return false end
+        NetworkedStateFields[prefix] = fields
+        StateKinds[prefix] = "custom"
+        addStatePoller("custom", prefix, interval)
+        return true
     end
 
     function addNetworkedGunState(prefix, interval, enableReloadTime)
@@ -867,6 +1170,7 @@ if SERVER then
         addNetworkedVariable(names.AmmoCount, interval)
         addNetworkedVariable(names.AmmoCountMax, interval)
         addNetworkedVariable(names.MagSize, interval)
+        addNetworkedVariable(names.MagRounds, interval)
         addStatePoller("gun", prefix, interval)
         return true
     end
@@ -943,11 +1247,12 @@ if SERVER then
             end
         end
         updateNetworkedVariable(names.AmmoType, acfValue(gun, "acfAmmoType", ""), interval)
-        updateNetworkedVariable(names.AmmoCount, acfValue(gun, "acfMagRounds", 0), interval)
+        updateNetworkedVariable(names.AmmoCount, acfValue(gun, "acfAmmoCount", 0), interval)
         if updateStatic then
             updateNetworkedVariable(names.AmmoCountMax, acfValue(gun, "acfTotalAmmoCount", 0), interval)
             updateNetworkedVariable(names.MagSize, acfValue(gun, "acfMagSize", 0), interval)
         end
+        updateNetworkedVariable(names.MagRounds, acfValue(gun, "acfMagRounds", 0), interval)
         deferStatePoll(prefix, interval)
         return gun ~= nil
     end
@@ -962,6 +1267,30 @@ if SERVER then
         if updateStatic then updateNetworkedVariable(names.ArmorMax, acfValue(prop, "acfPropArmorMax", 0), interval) end
         deferStatePoll(prefix, interval)
         return prop ~= nil
+    end
+
+    function updateStateSend(prefix, inputOrEntity, interval)
+        prefix = normalizeStatePrefix(prefix)
+        local fields = NetworkedStateFields[prefix]
+        if not fields then return false end
+
+        local ent = resolveEntity(inputOrEntity)
+        for i = 1, #fields do
+            local field = fields[i]
+            local value = field.fallback
+            if ent then
+                if field.fn then
+                    local ok, result = pcall(field.fn, ent, prefix, field)
+                    if ok and result ~= nil then value = result end
+                else
+                    value = acfValue(ent, field.method, field.fallback)
+                end
+            end
+            updateNetworkedVariable(field.name, value, interval)
+        end
+
+        deferStatePoll(prefix, interval)
+        return ent ~= nil
     end
 
     function safeWireCreate(entI, entO, inputName, outputName)
@@ -1002,6 +1331,8 @@ if SERVER then
                     updateNetworkedGunState(poller.prefix, InputValues[poller.prefix], poller.interval)
                 elseif poller.kind == "propArmor" then
                     updateNetworkedPropArmorState(poller.prefix, InputValues[poller.prefix], poller.interval)
+                elseif poller.kind == "custom" then
+                    updateStateSend(poller.prefix, InputValues[poller.prefix], poller.interval)
                 end
             end
 
@@ -1015,14 +1346,34 @@ if SERVER then
         flush(false)
     end)
 
-    hook.add("ClientInitialized", "SSSWH_ClientInit", function(ply)
+    timer.create("SSSWH_SendPending", NetworkFlushInterval, 0, function()
+        sendPendingRecords()
+    end)
+
+    local function sendCurrentRecordsToPlayer(ply)
         local records = {}
         for name, value in pairs(NetVarValues) do records[#records + 1] = { name, clone(value) } end
         if #records <= 0 then return end
-        local oldTargets = NetworkTargets
-        NetworkTargets = ply
-        sendRecords(records)
-        NetworkTargets = oldTargets
+        sendRecords(records, ply)
+    end
+
+    local function addConnectSendTarget(ply)
+        if not ConnectSendEnabled or not validRecipient(ply) then return end
+        ConnectSendTargets[ply] = true
+        local targetCount = 0
+        for _ in pairs(ConnectSendTargets) do targetCount = targetCount + 1 end
+        NetworkReplicationStats.connectSendTargets = targetCount
+        sendCurrentRecordsToPlayer(ply)
+    end
+
+    hook.add("ClientInitialized", "SSSWH_ClientInit", function(ply)
+        if ConnectSendEnabled then
+            addConnectSendTarget(ply)
+            return
+        end
+        timer.simple(NetworkFlushInterval, function()
+            if validRecipient(ply) then sendCurrentRecordsToPlayer(ply) end
+        end)
     end)
 else
     if getmetatable(InputValues) == nil then
@@ -1041,6 +1392,18 @@ else
         return entry
     end
 
+    function addNetworkedVariables(names, interval)
+        if type(names) ~= "table" then return 0 end
+
+        local count = 0
+        for i = 1, #names do
+            if addNetworkedVariable(names[i], interval) then
+                count = count + 1
+            end
+        end
+        return count
+    end
+
     function setNetworkedVariableInterval(name, interval)
         local entry = addNetworkedVariable(name, interval)
         return entry ~= nil
@@ -1057,8 +1420,74 @@ else
         return true
     end
 
+    function updateNetworkedVariables(values, interval)
+        if type(values) ~= "table" then return 0 end
+
+        local count = 0
+        for name, value in pairs(values) do
+            if updateNetworkedVariable(name, value, interval) then
+                count = count + 1
+            end
+        end
+        return count
+    end
+
     function addNetworkedVariableTrigger(name, fn)
         return NetVars[name]:addTrigger(fn)
+    end
+
+    local function normalizeStatePrefix(prefix)
+        if type(prefix) == "number" then return "State" .. prefix end
+        if type(prefix) == "string" and prefix ~= "" then return prefix end
+        return "State"
+    end
+
+    local function clientStateFieldSuffix(prefix, methodName, explicitName)
+        if type(explicitName) == "string" and explicitName ~= "" then return explicitName end
+        local suffix = tostring(methodName or "")
+        suffix = string.gsub(suffix, "^acf", "")
+        if string.sub(suffix, 1, #prefix) == prefix then suffix = string.sub(suffix, #prefix + 1) end
+        if suffix == "" then suffix = tostring(methodName or "Value") end
+        return suffix
+    end
+
+    local function addClientStateField(prefix, spec, index)
+        local methodName, fieldName, fallback
+        if type(spec) == "string" then
+            methodName = spec
+        elseif type(spec) == "function" then
+            methodName = "Value" .. tostring(index or 1)
+        elseif type(spec) == "table" then
+            methodName = spec.method or spec[1] or spec.name
+            fieldName = spec.field or spec[2]
+            fallback = spec.fallback
+            if fallback == nil then fallback = spec.default end
+            if fallback == nil then fallback = spec[3] end
+        end
+        if type(methodName) ~= "string" or methodName == "" then return nil end
+
+        local suffix = clientStateFieldSuffix(prefix, methodName, fieldName)
+        if fallback == nil then fallback = 0 end
+        StateFieldDefaults[suffix] = fallback
+        StateFieldSuffixes[suffix] = suffix
+        StateFieldSuffixes[string.sub(suffix, 1, 1):lower() .. string.sub(suffix, 2)] = suffix
+        addNetworkedVariable(prefix .. suffix, 0)
+        return true
+    end
+
+    function addStateSend(prefix, interval, ...)
+        prefix = normalizeStatePrefix(prefix)
+        local fields = {}
+        for i = 1, select("#", ...) do
+            if addClientStateField(prefix, select(i, ...), i) then fields[#fields + 1] = true end
+        end
+        NetworkedStateFields[prefix] = fields
+        StateKinds[prefix] = "custom"
+        return #fields > 0
+    end
+
+    function updateStateSend(prefix, inputOrEntity, interval)
+        return false
     end
 
     function addNetworkedGunState(prefix, interval, enableReloadTime)
@@ -1075,6 +1504,7 @@ else
         addNetworkedVariable(prefix .. "AmmoCount", interval)
         addNetworkedVariable(prefix .. "AmmoCountMax", interval)
         addNetworkedVariable(prefix .. "MagSize", interval)
+        addNetworkedVariable(prefix .. "MagRounds", interval)
         return true
     end
 
@@ -1098,6 +1528,7 @@ else
         updateNetworkedVariable(prefix .. "AmmoCount", 0, interval)
         updateNetworkedVariable(prefix .. "AmmoCountMax", 0, interval)
         updateNetworkedVariable(prefix .. "MagSize", 0, interval)
+        updateNetworkedVariable(prefix .. "MagRounds", 0, interval)
         return false
     end
 
