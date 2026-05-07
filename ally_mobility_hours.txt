@@ -35,7 +35,7 @@ BRAKE_SPEED_GATE = 30
 THINK_DT = 0.1
 
 GEARING_TYPE          = 3
-MAX_BRAKE_POWER       = 125
+MAX_BRAKE_POWER       = 150
 SCALE_BRAKES          = false
 WHEEL_DIAMETER        = 28
 FINAL_RATIO           = 0.18
@@ -44,9 +44,7 @@ DISABLE_NEUTRAL_STEER = false
 
 HAS_WHEELS = false
 WHEEL_COAST_WITHOUT_THROTTLE = true
-INVERTED_TRANSFERS = -1
-INLINE_TRANSFERS = true
-AUTO_DETECT_INLINE_TRANSFERS = true
+INVERTED_TRANSFERS = 1
 
 YAW_DEADZONE = 15
 COUNTERSTEER_STRENGTH = 2 -- legacy P gain (kept for compatibility)
@@ -62,6 +60,8 @@ CLUTCH_START = 0.8
 --- Internal Variables
 CLUTCH_TURN = 1
 CLUTCH_BRAKE = 1
+INLINE_TRANSFERS = true
+AUTO_DETECT_INLINE_TRANSFERS = true
 GearCount = 0
 GEAR_UP_BUFFER = 1.05
 GEAR_DOWN_BUFFER = 0.95
@@ -101,38 +101,38 @@ local function writeOutputs()
 
     if not MainWL then return end
 
-    MainWL["Gear"] = OutputGear
+    updateWirelinkField(MainWL, "Gear", OutputGear)
 
     if CanNeutralSteer then
         if not LeftWL or not RightWL then return end
 
-        LeftWL["Left Brake"] = OutputLeftBrake
-        LeftWL["Right Brake"] = OutputLeftBrake
-        RightWL["Left Brake"] = OutputRightBrake
-        RightWL["Right Brake"] = OutputRightBrake
+        updateWirelinkField(LeftWL, "Left Brake", OutputLeftBrake)
+        updateWirelinkField(LeftWL, "Right Brake", OutputLeftBrake)
+        updateWirelinkField(RightWL, "Left Brake", OutputRightBrake)
+        updateWirelinkField(RightWL, "Right Brake", OutputRightBrake)
 
-        LeftWL["Left Clutch"] = OutputLeftClutch
-        LeftWL["Right Clutch"] = OutputLeftClutch
-        RightWL["Left Clutch"] = OutputRightClutch
-        RightWL["Right Clutch"] = OutputRightClutch
+        updateWirelinkField(LeftWL, "Left Clutch", OutputLeftClutch)
+        updateWirelinkField(LeftWL, "Right Clutch", OutputLeftClutch)
+        updateWirelinkField(RightWL, "Left Clutch", OutputRightClutch)
+        updateWirelinkField(RightWL, "Right Clutch", OutputRightClutch)
 
         if INLINE_TRANSFERS then
-            LeftWL["Gear"] = OutputLeftGear
-            RightWL["Gear"] = OutputRightGear
+            updateWirelinkField(LeftWL, "Gear", OutputLeftGear)
+            updateWirelinkField(RightWL, "Gear", OutputRightGear)
         else
-            LeftWL["Left Gear"] = OutputLeftGear
-            LeftWL["Right Gear"] = OutputLeftGear
-            RightWL["Left Gear"] = OutputRightGear
-            RightWL["Right Gear"] = OutputRightGear
+            updateWirelinkField(LeftWL, "Left Gear", OutputLeftGear)
+            updateWirelinkField(LeftWL, "Right Gear", OutputLeftGear)
+            updateWirelinkField(RightWL, "Left Gear", OutputRightGear)
+            updateWirelinkField(RightWL, "Right Gear", OutputRightGear)
         end
     elseif DetectedDualClutch then
-        MainWL["Left Brake"] = OutputLeftBrake
-        MainWL["Right Brake"] = OutputRightBrake
-        MainWL["Left Clutch"] = OutputLeftClutch
-        MainWL["Right Clutch"] = OutputRightClutch
+        updateWirelinkField(MainWL, "Left Brake", OutputLeftBrake)
+        updateWirelinkField(MainWL, "Right Brake", OutputRightBrake)
+        updateWirelinkField(MainWL, "Left Clutch", OutputLeftClutch)
+        updateWirelinkField(MainWL, "Right Clutch", OutputRightClutch)
     else
-        MainWL["Brake"] = OutputLeftBrake
-        MainWL["Clutch"] = OutputLeftClutch
+        updateWirelinkField(MainWL, "Brake", OutputLeftBrake)
+        updateWirelinkField(MainWL, "Clutch", OutputLeftClutch)
     end
 end
 
@@ -332,8 +332,7 @@ local function think()
     local speed = math.sqrt(vel.x * vel.x + vel.y * vel.y) * SPEEDCONV
     local rpm = ActiveEngine:acfRPM()
     local driveDir = (Pod["W"] or 0) - (Pod["S"] or 0)
-    local steerSign = INVERTED_TRANSFERS < 0 and 1 or -1
-    local steerDir = ((Pod["D"] or 0) - (Pod["A"] or 0)) * steerSign
+    local steerDir = (Pod["D"] or 0) - (Pod["A"] or 0)
     local neutralSteerEnabled = CanNeutralSteer and not HAS_WHEELS and not DISABLE_NEUTRAL_STEER
     local brakeSteerEnabled = not HAS_WHEELS and not neutralSteerEnabled
     local hasDriveInput = driveDir ~= 0
@@ -526,7 +525,7 @@ local function think()
 
             CounterSteerPrevError = err
 
-            local direction = (driveDir ~= 0 and driveDir or 1) * steerSign
+            local direction = driveDir ~= 0 and driveDir or 1
 
             if yawRate * direction < 0 then
                 OutputLeftBrake = math.max(OutputLeftBrake, counterSteerWeight)
