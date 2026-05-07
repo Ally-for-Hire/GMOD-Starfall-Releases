@@ -63,12 +63,14 @@ if SERVER then
     Outputs.CamFOV:update(100)
     Outputs.CamActive:update(0)
 
-    addNetworkedVariable("Driver")
-    addNetworkedVariable("ChairState")
-    addNetworkedVariable("MainParentState")
-    addNetworkedVariable("SecondaryParentState")
-    addNetworkedVariable("TertiaryParentState")
-    addNetworkedVariable("FilterState")
+    addNetworkedVariables({
+        "Driver",
+        "ChairState",
+        "MainParentState",
+        "SecondaryParentState",
+        "TertiaryParentState",
+        "FilterState"
+    })
 
     local function refreshServerInputs()
         INPUTS.Chair = sanitizeEntityInput(InputValues.Chair, chip())
@@ -118,12 +120,14 @@ if SERVER then
         if driverVar ~= nil then
             driverVar.forceMeta = true
         end
-        updateNetworkedVariable("Driver", SHARED.Driver)
-        updateNetworkedVariable("ChairState", INPUTS.Chair)
-        updateNetworkedVariable("MainParentState", INPUTS.MainParent)
-        updateNetworkedVariable("SecondaryParentState", INPUTS.SecondaryParent)
-        updateNetworkedVariable("TertiaryParentState", INPUTS.TertiaryParent)
-        updateNetworkedVariable("FilterState", INPUTS.Filter)
+        updateNetworkedVariables({
+            Driver = SHARED.Driver,
+            ChairState = INPUTS.Chair,
+            MainParentState = INPUTS.MainParent,
+            SecondaryParentState = INPUTS.SecondaryParent,
+            TertiaryParentState = INPUTS.TertiaryParent,
+            FilterState = INPUTS.Filter
+        })
     end
 
     local function setDriver(ply)
