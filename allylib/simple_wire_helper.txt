@@ -8,15 +8,18 @@ Direct-global wire helper layered over starfall_wire_networking_interface.txt.
 
 The networking interface remains the compatibility backend. This helper changes the front-end style:
 - `updateInputs("Base:ENTITY RWR:ENTITY")` creates globals `Base` and `RWR`.
+- `updateOutputs("HitPos:VECTOR")` creates globals that write outputs when assigned on the server.
 - `networkInputs("Base RWR", interval)` chooses which input globals replicate to clients.
 - `addNetworkedVariable("TargetState", interval, {})` creates a global `TargetState`.
 - Assigning `TargetState = {...}` on the server queues the networked variable update.
 - `inputClk(name, fn)` and `netVarClk(name, fn)` keep triggers name-based.
+- NetVars are connect-send gated by default; call `enableConnectSend(false)` to restore broadcast sends.
 
 Do not declare direct globals as `local`. Reads and writes must go through `_G`.
 ]]--
 
 local base = require("starfall_wire_networking_interface.txt")
+enableConnectSend(true)
 
 DirectWireValues = DirectWireValues or {}
 DirectWireRegistered = DirectWireRegistered or {}
@@ -27,6 +30,7 @@ DirectWireNetVarTriggers = DirectWireNetVarTriggers or {}
 DirectWireInstalled = DirectWireInstalled or false
 
 local BaseUpdateInputs = updateInputs
+local BaseUpdateOutputs = updateOutputs
 local BaseAddNetworkedVariable = addNetworkedVariable
 local BaseSetNetworkedVariableInterval = setNetworkedVariableInterval
 local BaseUpdateNetworkedVariable = updateNetworkedVariable
@@ -153,15 +157,36 @@ local function installGlobalAccessors()
     local oldIndex = oldMeta.__index
     local oldNewIndex = oldMeta.__newindex
 
+    local kinds = DirectWireKinds
+    local values = DirectWireValues
+    local cachedInputs = InputValues
+    local cachedNetVars = NetVarValues
+
     oldMeta.__index = function(tbl, key)
-        if DirectWireRegistered[key] then return DirectWireValues[key] end
-        if type(oldIndex) == "function" then return oldIndex(tbl, key) end
-        if type(oldIndex) == "table" then return oldIndex[key] end
-        return nil
+        local kind = kinds[key]
+        if kind == nil then
+            if type(oldIndex) == "function" then return oldIndex(tbl, key) end
+            if type(oldIndex) == "table" then return oldIndex[key] end
+            return nil
+        end
+
+        if kind == "input" then
+            local v = cachedInputs[key]
+            if v ~= nil then return v end
+            return values[key]
+        end
+
+        if kind == "netvar" then
+            local v = cachedNetVars[key]
+            if v ~= nil then return v end
+            return values[key]
+        end
+
+        return values[key]
     end
 
     oldMeta.__newindex = function(tbl, key, value)
-        if DirectWireRegistered[key] then
+        if kinds[key] ~= nil then
             setDirectValue(key, value, "assign")
             return
         end
@@ -192,15 +217,19 @@ end
 setDirectValue = function(name, value, source)
     if not DirectWireRegistered[name] then return false end
 
+    local kind = DirectWireKinds[name]
     DirectWireValues[name] = value
-    if DirectWireKinds[name] == "input" then InputValues[name] = value end
 
-    local willNetwork = source == "assign" and SERVER and DirectWireNetworked[name]
+    if kind == "output" and SERVER and Outputs[name] then
+        Outputs[name]:update(value)
+    end
+
+    local willNetwork = source == "assign" and SERVER and DirectWireNetworked[name] and kind ~= "output"
     if willNetwork then
         BaseUpdateNetworkedVariable(name, value)
     end
 
-    if source ~= "trigger" and source ~= "netvar" and not willNetwork then
+    if source ~= "netvar" and not willNetwork then
         runDirectTriggers(DirectWireTriggers, name, value)
     end
     return true
@@ -227,6 +256,14 @@ function changedClk(name, callback)
     local list = DirectWireTriggers[name] or {}
     DirectWireTriggers[name] = list
     list[#list + 1] = callback
+
+    if DirectWireKinds[name] == "input" and not DirectWireTriggers["__input:" .. name] then
+        DirectWireTriggers["__input:" .. name] = true
+        inputClk(name, function(value)
+            runDirectTriggers(DirectWireTriggers, name, value)
+        end)
+    end
+
     return #list
 end
 
@@ -235,16 +272,39 @@ function updateInputs(str)
     for i = 1, #names do
         local name = names[i]
         registerDirectName(name, defaultForPort(name, types[i]), "input")
-        setDirectValue(name, inputs[name]:get() or DirectWireValues[name], "input")
-
-        if not DirectWireTriggers["__input:" .. name] then
-            DirectWireTriggers["__input:" .. name] = true
-            inputClk(name, function(value)
-                setDirectValue(name, value, "input")
-            end)
+        if InputValues[name] == nil then
+            local current = inputs[name]:get()
+            if current ~= nil then InputValues[name] = current end
         end
     end
     return names, types, inputs
+end
+
+function updateOutputs(str)
+    local names, types, outputs = BaseUpdateOutputs(str)
+    for i = 1, #names do
+        local name = names[i]
+        registerDirectName(name, defaultForPort(name, types[i]), "output")
+    end
+    return names, types, outputs
+end
+
+function updateOutput(name, value)
+    if type(name) ~= "string" or not Outputs[name] then return false end
+    if not DirectWireRegistered[name] then
+        registerDirectName(name, defaultForName(name), "output")
+    end
+    return setDirectValue(name, value, "output")
+end
+
+function updateOutputValues(values)
+    if type(values) ~= "table" then return 0 end
+
+    local count = 0
+    for name, value in pairs(values) do
+        if updateOutput(name, value) then count = count + 1 end
+    end
+    return count
 end
 
 function networkInputs(namesOrAll, interval)
