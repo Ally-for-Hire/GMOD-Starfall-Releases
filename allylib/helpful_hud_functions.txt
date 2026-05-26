@@ -15,6 +15,7 @@ Function index:
 - `drawCenterRT(x, y, rtname, divisor)`: draws a render target centered on screen.
 - `initRT(rtName)`: creates and returns a render target name.
 - `selectClearRT(rtName)`: selects and clears a render target.
+- `scaleToScreen(baseWidth, baseHeight)`: returns scale and centered offsets for fitting a virtual resolution to the current screen.
 - `rect`, `centerRect`, `centerRectOutline`, `rectOutline`, `circle`, `filledCircle`, `circleFilled`, `font`, `color`, `text`, `textSimple`, `line`, `spacedLine`: convenience aliases for common draw operations.
 - `COL_BLACK`, `COL_WHITE`, `COL_RED`, `COL_GREEN`, `COL_BLUE`, `COL_GRAY`, `COL_ORANGE`, `COL_PURPLE`, `COL_GOLD`, `COL_YELLOW`, `COL_CYAN`, `COL_RENDERTARGET`: shared color constants.
 ]]--
@@ -204,6 +205,17 @@ if CLIENT then
     function selectClearRT(rtName)
         _selectRT(rtName)
         render.clear(COL_RENDERTARGET)
+    end
+
+    --- Fits a virtual/base resolution inside the current screen resolution.
+    -- returns: scale, x offset, y offset, screen width, screen height
+    function scaleToScreen(baseWidth, baseHeight)
+        local screenW, screenH = render.getResolution()
+        local scale = math.min(screenW / baseWidth, screenH / baseHeight)
+        local offsetX = (screenW - baseWidth * scale) * 0.5
+        local offsetY = (screenH - baseHeight * scale) * 0.5
+
+        return scale, offsetX, offsetY, screenW, screenH
     end
 
     -- Convenient Functions
