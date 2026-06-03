@@ -1,0 +1,72 @@
+--@name Arma HUD True
+--@author Ally for Hire / Merydian9
+--@include allylib/helpful_hud_functions.txt
+--@include allylib/simple_wire_helper.txt
+--@shared
+
+require("allylib/helpful_hud_functions.txt")
+require("allylib/simple_wire_helper.txt")
+
+local P = player()
+local O = owner()
+local PREF = "aht_"
+local VEHICLE_NAME = "M1A2T Abrams"
+
+if CLIENT then
+    enableHud(O, true)
+    
+    local BASE_H = 1080
+
+    local FONT_MAIN = render.createFont("Default", math.max(1, math.floor(20 * scale + 0.5)), 1600, nil, nil, nil, true)
+    local COL_MAIN = Color(255, 255, 255, 255)
+    local COL_OUTLINE = Color(0, 0, 0, 255)
+    local COL_BG = Color(0, 0, 0, 155)
+    local RT_CENTER = initRT("CENTER")
+    local RT_VEHICLE_INFO = initRT("VEHICLE INFO")
+    local RT_WEAPON_INFO = initRT("WEAPON INFO")
+
+    hook.add("drawhud", PREF .. "draw", function()
+        local resx, resy = render.getResolution()
+        local scale = resy / BASE_H
+        local rtDivisor = 2 / scale
+        
+        font(FONT_MAIN)
+        color(COL_WHITE)
+        drawCenterRT(resx * 0.5, resy * 0.5, RT_CENTER, rtDivisor)
+        drawCenterRT(185 * scale, 85 * scale, RT_VEHICLE_INFO, rtDivisor)
+        drawCenterRT(resx - 185 * scale, 85 * scale, RT_WEAPON_INFO, rtDivisor)
+
+        font(fontMain)
+        simpleText(20 * scale, 20 * scale, VEHICLE_NAME, TEXT_ALIGN.LEFT, TEXT_ALIGN.CENTER)
+    end)
+    
+    hook.add("renderoffscreen", PREF .. "static", function()
+        local x, y = 512, 512
+        local centerScale = 1024 / 512
+        local panelScale = 1024 / 512
+        
+        selectClearRT(RT_CENTER)
+            color(COL_OUTLINE)
+            circle(x, y, 9 * centerScale, 3 * centerScale)
+            color(COL_MAIN)
+            circle(x, y, 10 * centerScale, 1 * centerScale)
+        
+        selectClearRT(RT_VEHICLE_INFO)
+            color(COL_BG)
+            centerRect(x, y + 2.5 * panelScale, 400 * panelScale, 95 * panelScale)
+            centerRect(x - 172 * panelScale, y - 47.5 * panelScale, 2 * panelScale, 5 * panelScale)
+            centerRect(x + 172 * panelScale, y - 47.5 * panelScale, 2 * panelScale, 5 * panelScale)
+            centerRect(x, y - 62.5 * panelScale, 400 * panelScale, 25 * panelScale)
+            centerRect(x, y + 62.5 * panelScale, 400 * panelScale, 25 * panelScale)
+            
+        selectClearRT(RT_WEAPON_INFO)
+            color(COL_BG)
+            centerRect(x, y + 2.5 * panelScale, 400 * panelScale, 95 * panelScale)
+            centerRect(x - 172 * panelScale, y - 47.5 * panelScale, 2 * panelScale, 5 * panelScale)
+            centerRect(x + 172 * panelScale, y - 47.5 * panelScale, 2 * panelScale, 5 * panelScale)
+            centerRect(x, y - 62.5 * panelScale, 400 * panelScale, 25 * panelScale)
+            centerRect(x, y + 62.5 * panelScale, 400 * panelScale, 25 * panelScale)
+          
+    hook.remove("renderoffscreen", PREF .. "static")
+    end)
+end
