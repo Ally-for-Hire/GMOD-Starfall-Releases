@@ -1,417 +1,566 @@
 --@name Ally Mobility Hours
 --@author Ally for Hire / Merydian9
 --@include allylib/simple_wire_helper.txt
+--@include allylib/general_algorithms.txt
 --@server
 
---- Version 0.13.12
+--- Version 0.16.2
 -- Sourced from https://github.com/Ally-for-Hire/gmod-starfall-projects/blob/main/ally_mobility_hours.txt
+-- Death-hardening: every wirelink write is pcall-protected, because a wirelink
+-- to a dead entity throws "Object no longer valid" on any access (so an
+-- isValid(wl) probe cannot guard it -- the probe itself raises). The Pod
+-- wirelink is isValid-gated in fail-closed, and stale engine/transfer writes
+-- are swallowed instead of indexing into a NULL entity. The chip drops to
+-- fail-closed on the next tick when any cached entity dies.
 
 --[[
-Tracked/wheeled ACF mobility controller.
-Inputs: Engine, MainGearbox, Base, Pod wirelink.
-Outputs: Throttle, LeftWeldLatch, RightWeldLatch.
-GEARING_TYPE: 1 = RPM, 2 = speed, 3 = hybrid.
+Tracked / wheeled ACF mobility controller.
+Inputs:  MainGearbox, Base, Pod wirelink.
+Outputs: LeftWeldLatch, RightWeldLatch.
+Engines are auto-discovered from MainGearbox:acfLinks() (recursing through
+transfer cases when needed) and driven directly via their own wirelinks, so
+no Engine wire input or Throttle wire output is required.
+
+Drive convention (applied in both neutral-steer and brake-steer branches):
+  A / left  -> brake / disengage the LEFT side.
+  D / right -> brake / disengage the RIGHT side.
+If a vehicle is wired backwards, flip INVERT_BRAKE_STEER (brake-steer chassis)
+or INVERT_COUNTERSTEER (yaw correction) to swap that branch's polarity.
 ]]--
 
 require("allylib/simple_wire_helper.txt")
+require("allylib/general_algorithms.txt")
 
-updateInputs("Engine:ENTITY MainGearbox:ENTITY Base:ENTITY Pod:WIRELINK")
-updateOutputs("Throttle:NORMAL LeftWeldLatch:NORMAL RightWeldLatch:NORMAL")
+updateInputs("MainGearbox:ENTITY Base:ENTITY Pod:WIRELINK")
+updateOutputs("LeftWeldLatch:NORMAL RightWeldLatch:NORMAL")
 
-EngineStateDirty = true
+----------------------------------------------------------------------
+-- Config
+----------------------------------------------------------------------
+-- Exact in-game speed scale for converting Base velocity to km/h.
+SPEEDCONV         = 1 / (39.3701 * 3.6)
+THINK_DT          = 0.1
+WHEEL_DIAMETER    = 19.5 * 2
+GEAR_SHIFT_MARGIN = 0.95
+IDLE_THROTTLE     = 40
 
-Inputs.Engine:addTrigger(function() EngineStateDirty = true end)
-Inputs.MainGearbox:addTrigger(function() EngineStateDirty = true end)
+MAX_BRAKE_POWER  = 100
+SCALE_BRAKES     = false
+BRAKE_SPEED_GATE = 50      -- km/h
+MAX_YAW_RATE     = 240
 
---- Config
-SPEEDCONV = 1 / 17.6
-MAX_YAW_RATE = 240
-BRAKE_SPEED_GATE = 30
-THINK_DT = 0.1
+HAS_WHEELS                   = false
+DISABLE_NEUTRAL_STEER        = false
+INVERTED_TRANSFERS           = false   -- physical L/R transfer layout on the gearbox
+INVERT_BRAKE_STEER           = true   -- chassis is wired so default A/D feels swapped
+INVERT_COUNTERSTEER          = true   -- swap counter-steer side
+INVERT_REVERSE_STEER         = false  -- swap steer direction while reversing
+INLINE_TRANSFERS             = true   -- transfers expose one "Gear" field (stock ACF)
 
-GEARING_TYPE          = 3
-MAX_BRAKE_POWER       = 100
-SCALE_BRAKES          = false
-WHEEL_DIAMETER        = 28
-FINAL_RATIO           = 0.18
-IDLE_THROTTLE         = 40
-DISABLE_NEUTRAL_STEER = false
+-- Counter-steer only runs when driving straight (throttle, no steering input).
+YAW_DEADZONE           = 20
+COUNTERSTEER_STRENGTH  = 2     -- P gain
+COUNTERSTEER_KI        = 0     -- I gain
+COUNTERSTEER_KD        = 0.05  -- D gain (helps damp without windup)
+COUNTERSTEER_MIN_BRAKE = MAX_BRAKE_POWER / 2
 
-HAS_WHEELS = false
-WHEEL_COAST_WITHOUT_THROTTLE = true
-INVERTED_TRANSFERS = true
-INVERT_BRAKE_STEER = true
-
--- Countersteer only runs when driving straight. It uses the same side convention as A/D:
--- A / left turn brakes the left side, D / right turn brakes the right side.
-YAW_DEADZONE = 15
-COUNTERSTEER_STRENGTH = 2 -- legacy P gain (kept for compatibility)
-COUNTERSTEER_MIN_BRAKE = 35
-COUNTERSTEER_KI = 0
-COUNTERSTEER_KD = 0.05 -- small D term for easier damping tuning
-
--- Optional "reverse bite" for split-transfer neutral steer.
--- 0 disables it; 1 is a full opposite-gear bite after ACTUAL_COUNTERSTEER_THRESHOLD.
-ACTUAL_COUNTERSTEER_THRESHOLD = 0.5
+-- "Reverse bite": once counter-steer PID saturates, flip a transfer-side into
+-- reverse for a harder bite. THRESHOLD of 1 disables it; 0 always engages.
+ACTUAL_COUNTERSTEER_THRESHOLD  = 0.5
 ACTUAL_COUNTERSTEER_ENGAGEMENT = 1.0
 
-INVERT_REVERSE_STEER = false
-CLUTCH_START = 0.8
+CLUTCH_START = 0.8 -- start releasing clutch once RPM hits PowerMin * this
+DEBUG_GEARS  = false
 
---- Internal Variables
-CLUTCH_TURN = 1
-CLUTCH_BRAKE = 1
--- ACF transfer wire values: 1 is forward, 2 is reverse.
+----------------------------------------------------------------------
+-- Constants (don't tune)
+----------------------------------------------------------------------
+CLUTCH_FULL = 1 -- ACF clutch input: 1 disengages, 0 fully engages
+-- ACF transfer-case "Gear" field: 1 = forward, 2 = reverse.
 FORWARD_TRANSFER_GEAR = 1
 REVERSE_TRANSFER_GEAR = 2
-INLINE_TRANSFERS = true
-AUTO_DETECT_INLINE_TRANSFERS = true
-GearCount = 0
-GEAR_UP_BUFFER = 1.05
-GEAR_DOWN_BUFFER = 0.95
-BiteRPM, ReleaseRPM = 0, 0
-PowerMin, PowerMax = 0, 0
-UpshiftRPM, DownshiftRPM = 0, 0
 
-MainWL, LeftWL, RightWL = nil, nil, nil
-ActiveEngine = nil
-EngineReady = false
+----------------------------------------------------------------------
+-- Mutable state
+----------------------------------------------------------------------
+MainWL, LeftWL, RightWL       = nil, nil, nil
+LeftTransfer, RightTransfer   = nil, nil
+ActiveEngine                  = nil
+Engines, EngineWeights        = {}, {}
+EngineWLs                     = {}
+EngineCount, EngineWeight     = 0, 0
+EngineReady                   = false
+PowerMin, PowerMax            = 0, 0
+BiteRPM, ReleaseRPM           = 0, 0
+TransferRatio                 = 1
+PrevWrittenGear               = nil  -- debug: last Gear value actually written
 
-GearSpeeds = {}
-GearSlots = {}
-ReverseGearSlots = {}
-ReverseGearSpeeds = {}
-ReverseGears = 0
-IsAutogearing = false
-CanNeutralSteer = false
-DetectedDualClutch = false
+GearSlots, ReverseGearSlots   = {}, {}
+GearSpeeds, GearShiftSpeeds   = {}, {} -- combined: 1..GearCount fwd, +ReverseGears rev
+ReverseGearSpeeds             = {}
+GearCount, ReverseGears       = 0, 0
+IsAutogearing                 = false
+CanNeutralSteer               = false
+DetectedDualClutch            = false
 
-OutputGear = 1
-OutputGearSlot = 1
-OutputThrottle = 0
-OutputRightGear, OutputLeftGear = FORWARD_TRANSFER_GEAR, FORWARD_TRANSFER_GEAR
-OutputRightClutch, OutputLeftClutch = CLUTCH_BRAKE, CLUTCH_BRAKE
-OutputRightBrake, OutputLeftBrake = MAX_BRAKE_POWER, MAX_BRAKE_POWER
-LeftTransfer, RightTransfer = nil, nil
+OutputGearSlot                = 1
+OutputGear                    = 1
+OutputThrottle                = 0
+OutputLeftGear, OutputRightGear     = FORWARD_TRANSFER_GEAR, FORWARD_TRANSFER_GEAR
+OutputLeftClutch, OutputRightClutch = CLUTCH_FULL, CLUTCH_FULL
+OutputLeftBrake, OutputRightBrake   = MAX_BRAKE_POWER, MAX_BRAKE_POWER
 
-CounterSteerI = 0
+CounterSteerI         = 0
 CounterSteerPrevError = 0
 
---- Functions
-local function writeOutputs()
-    Outputs.Throttle:update(OutputThrottle)
-    Outputs.LeftWeldLatch:update(OutputLeftBrake > 0 and 1 or 0)
-    Outputs.RightWeldLatch:update(OutputRightBrake > 0 and 1 or 0)
+EngineStateDirty = true
+inputClk("MainGearbox", function() EngineStateDirty = true end)
 
-    if not MainWL then return end
+local PrevMainGearbox = nil
 
-    updateWirelinkField(MainWL, "Gear", OutputGear)
+----------------------------------------------------------------------
+-- Wire writers
+----------------------------------------------------------------------
+local function setField(wl, field, value)
+    if not wl then return end
+    -- A wirelink whose entity has died throws "Object no longer valid" on ANY
+    -- access -- including isValid(wl) -- so a probe-then-write guard can never
+    -- be made safe: the probe is what raises. pcall the write itself so a
+    -- mid-tick engine/gearbox death is swallowed here and the chip drops to
+    -- fail-closed on the next refresh instead of erroring the whole callback.
+    pcall(updateWirelinkField, wl, field, value)
+end
 
-    if CanNeutralSteer then
-        if not LeftWL or not RightWL then return end
+local function setBothFields(wl, fieldA, fieldB, value)
+    setField(wl, fieldA, value)
+    setField(wl, fieldB, value)
+end
 
-        updateWirelinkField(LeftWL, "Left Brake", OutputLeftBrake)
-        updateWirelinkField(LeftWL, "Right Brake", OutputLeftBrake)
-        updateWirelinkField(RightWL, "Left Brake", OutputRightBrake)
-        updateWirelinkField(RightWL, "Right Brake", OutputRightBrake)
-
-        updateWirelinkField(LeftWL, "Left Clutch", OutputLeftClutch)
-        updateWirelinkField(LeftWL, "Right Clutch", OutputLeftClutch)
-        updateWirelinkField(RightWL, "Left Clutch", OutputRightClutch)
-        updateWirelinkField(RightWL, "Right Clutch", OutputRightClutch)
-
-        if INLINE_TRANSFERS then
-            updateWirelinkField(LeftWL, "Gear", OutputLeftGear)
-            updateWirelinkField(RightWL, "Gear", OutputRightGear)
-        else
-            updateWirelinkField(LeftWL, "Left Gear", OutputLeftGear)
-            updateWirelinkField(LeftWL, "Right Gear", OutputLeftGear)
-            updateWirelinkField(RightWL, "Left Gear", OutputRightGear)
-            updateWirelinkField(RightWL, "Right Gear", OutputRightGear)
-        end
-    elseif DetectedDualClutch then
-        updateWirelinkField(MainWL, "Left Brake", OutputLeftBrake)
-        updateWirelinkField(MainWL, "Right Brake", OutputRightBrake)
-        updateWirelinkField(MainWL, "Left Clutch", OutputLeftClutch)
-        updateWirelinkField(MainWL, "Right Clutch", OutputRightClutch)
+local function setSideGear(wl, gear)
+    if INLINE_TRANSFERS then
+        setField(wl, "Gear", gear)
     else
-        updateWirelinkField(MainWL, "Brake", OutputLeftBrake)
-        updateWirelinkField(MainWL, "Clutch", OutputLeftClutch)
+        setBothFields(wl, "Left Gear", "Right Gear", gear)
     end
 end
 
-local function updateEngineVariables()
-    EngineStateDirty = false
-    MainWL, LeftWL, RightWL = nil, nil, nil
-    ActiveEngine = nil
-    LeftTransfer, RightTransfer = nil, nil
-    CanNeutralSteer = false
-    DetectedDualClutch = false
-    EngineReady = false
-    for i = 1, #GearSpeeds do GearSpeeds[i] = nil end
-    for i = 1, #GearSlots do GearSlots[i] = nil end
-    for i = 1, #ReverseGearSlots do ReverseGearSlots[i] = nil end
-    for i = 1, #ReverseGearSpeeds do ReverseGearSpeeds[i] = nil end
+-- Drive every discovered engine via its own wirelink. The chip no longer
+-- exposes a Throttle wire output; throttle and Active are routed directly.
+local function writeEngineWires(throttle, active)
+    local activeNum = active and 1 or 0
+    for i = 1, EngineCount do
+        local wl = EngineWLs[i]
+        if wl then
+            setField(wl, "Throttle", throttle)
+            setField(wl, "Active",   activeNum)
+        end
+    end
+end
 
-    if not isValid(MainGearbox) then
-        EngineReady = false
-        return
+local function snapshotEngineWLs()
+    local snapshot = {}
+    for i = 1, #EngineWLs do snapshot[i] = EngineWLs[i] end
+    return snapshot
+end
+
+local function hasCurrentEngineWL(wl)
+    for i = 1, EngineCount do
+        if EngineWLs[i] == wl then return true end
+    end
+    return false
+end
+
+local function stopStaleEngineWires(previousWLs)
+    for i = 1, #previousWLs do
+        local wl = previousWLs[i]
+        if wl and not hasCurrentEngineWL(wl) then
+            setField(wl, "Throttle", 0)
+            setField(wl, "Active",   0)
+        end
+    end
+end
+
+local function writeOutputs()
+    LeftWeldLatch  = OutputLeftBrake  > 0 and 1 or 0
+    RightWeldLatch = OutputRightBrake > 0 and 1 or 0
+
+    writeEngineWires(OutputThrottle, EngineReady)
+
+    if not MainWL then return end
+    setField(MainWL, "Gear", OutputGear)
+
+    if DEBUG_GEARS and OutputGear ~= PrevWrittenGear then
+        print("AMH shift -> Gear", OutputGear, "slot", OutputGearSlot, "auto", IsAutogearing)
+        PrevWrittenGear = OutputGear
     end
 
-    local gearLinks = MainGearbox:acfLinks()
-
-    if isValid(Engine) then
-        ActiveEngine = Engine
+    if CanNeutralSteer then
+        if not LeftWL or not RightWL then return end
+        setBothFields(LeftWL,  "Left Brake",  "Right Brake",  OutputLeftBrake)
+        setBothFields(RightWL, "Left Brake",  "Right Brake",  OutputRightBrake)
+        setBothFields(LeftWL,  "Left Clutch", "Right Clutch", OutputLeftClutch)
+        setBothFields(RightWL, "Left Clutch", "Right Clutch", OutputRightClutch)
+        setSideGear(LeftWL,  OutputLeftGear)
+        setSideGear(RightWL, OutputRightGear)
+    elseif DetectedDualClutch then
+        setField(MainWL, "Left Brake",   OutputLeftBrake)
+        setField(MainWL, "Right Brake",  OutputRightBrake)
+        setField(MainWL, "Left Clutch",  OutputLeftClutch)
+        setField(MainWL, "Right Clutch", OutputRightClutch)
     else
-        local bestPowerMax = -1
-        for i = 1, #gearLinks do
-            local link = gearLinks[i]
-            if isValid(link) then
-                local class = link:getClass()
-                if class ~= "prop_physics" and class:find("engine", 1, true) then
-                    local powerMax = link:acfPowerbandMax()
-                    if powerMax > bestPowerMax then
-                        ActiveEngine = link
-                        bestPowerMax = powerMax
-                    end
-                end
-            end
+        setField(MainWL, "Brake",  OutputLeftBrake)
+        setField(MainWL, "Clutch", OutputLeftClutch)
+    end
+end
+
+----------------------------------------------------------------------
+-- Output mutators
+----------------------------------------------------------------------
+local function setBothSides(brake, clutch)
+    OutputLeftBrake,  OutputRightBrake  = brake, brake
+    OutputLeftClutch, OutputRightClutch = clutch, clutch
+end
+
+local function addLeftSide(brake, clutch)
+    OutputLeftBrake  = math.max(OutputLeftBrake,  brake)
+    OutputLeftClutch = math.max(OutputLeftClutch, clutch)
+end
+
+local function addRightSide(brake, clutch)
+    OutputRightBrake  = math.max(OutputRightBrake,  brake)
+    OutputRightClutch = math.max(OutputRightClutch, clutch)
+end
+
+local function addTurnBrake(turnDir, brake, clutch)
+    if turnDir > 0 then addRightSide(brake, clutch) else addLeftSide(brake, clutch) end
+end
+
+local function flipTransferGear(g)
+    return g == FORWARD_TRANSFER_GEAR and REVERSE_TRANSFER_GEAR or FORWARD_TRANSFER_GEAR
+end
+
+----------------------------------------------------------------------
+-- ACF helpers
+-- Class-string checks first; ACF starfall methods throw on non-ACF ents.
+----------------------------------------------------------------------
+local function isInputEntity(ent)
+    return isValid(ent) and ent ~= chip()
+end
+
+-- isValid(wirelink) raises "Object no longer valid" when the wrapped entity has
+-- died, so a wirelink validity check has to be pcall-wrapped to fail closed.
+local function isWirelinkAlive(wl)
+    if not wl then return false end
+    local ok, valid = pcall(isValid, wl)
+    return ok and valid == true
+end
+
+local function isACFEntity(ent)
+    if not isValid(ent) then return false end
+    local class = ent:getClass()
+    return class ~= nil and class:find("acf_", 1, true) == 1
+end
+
+local function isEngine(ent)
+    return isACFEntity(ent) and ent:acfIsEngine()
+end
+
+local function isGearbox(ent)
+    return isACFEntity(ent) and ent:acfIsGearbox()
+end
+
+local function isDualClutch(ent)
+    return isGearbox(ent) and ent:acfIsDual()
+end
+
+local function isTransferCase(ent)
+    if not isACFEntity(ent) then return false end
+    local t = ent:acfType()
+    return t == "Transfer Case" or t == "Transfer"
+end
+
+local function gearboxTotalRatio(ent, gear)
+    if not isValid(ent) then return 1 end
+    local r = (ent:acfGearRatio(gear or 1) or 1) * (ent:acfFinalRatio() or 1)
+    if r == 0 then return 1 end
+    return math.abs(r)
+end
+
+----------------------------------------------------------------------
+-- Engine bookkeeping
+----------------------------------------------------------------------
+local function containsEntity(tbl, ent)
+    for i = 1, #tbl do if tbl[i] == ent then return true end end
+    return false
+end
+
+local function clearArray(t)
+    for i = 1, #t do t[i] = nil end
+end
+
+local function addEngine(ent)
+    if not isEngine(ent) or containsEntity(Engines, ent) then return end
+
+    local wl = ent:getWirelink()
+    if not wl then return end
+
+    local powerMin = ent:acfPowerbandMin() or 0
+    local powerMax = ent:acfPowerbandMax() or 0
+    local weight = math.max(ent:acfMaxTorque() or 0, 1)
+    EngineCount = EngineCount + 1
+    Engines[EngineCount]       = ent
+    EngineWeights[EngineCount] = weight
+    EngineWLs[EngineCount]     = wl
+    EngineWeight = EngineWeight + weight
+    PowerMin = PowerMin + powerMin * weight
+    PowerMax = PowerMax + powerMax * weight
+
+    if not ActiveEngine or powerMax > (ActiveEngine:acfPowerbandMax() or 0) then
+        ActiveEngine = ent
+    end
+end
+
+-- Walk MainGearbox links for engines; if none are direct, descend one level
+-- through transfer cases and gearboxes so engine -> transfer -> mainGearbox
+-- and engine -> gearbox -> mainGearbox layouts still discover the engines.
+local function discoverEngines(gearLinks)
+    for i = 1, #gearLinks do addEngine(gearLinks[i]) end
+    if EngineCount > 0 then return end
+    for i = 1, #gearLinks do
+        local link = gearLinks[i]
+        if isTransferCase(link) or isGearbox(link) then
+            local subLinks = link:acfLinks()
+            for j = 1, #subLinks do addEngine(subLinks[j]) end
         end
     end
+end
 
-    if not isValid(ActiveEngine) then
-        return
+local function enginesReady()
+    if EngineCount < 1 then return false end
+    for i = 1, EngineCount do
+        if not isEngine(Engines[i]) or EngineWLs[i] == nil then return false end
     end
+    return true
+end
 
-    PowerMin = ActiveEngine:acfPowerbandMin()
-    PowerMax = ActiveEngine:acfPowerbandMax()
+local function getEngineRPM()
+    local rpm, weight = 0, 0
+    for i = 1, EngineCount do
+        local e = Engines[i]
+        if isEngine(e) then
+            local w = EngineWeights[i] or 1
+            rpm    = rpm + (e:acfRPM() or 0) * w
+            weight = weight + w
+        end
+    end
+    return weight > 0 and rpm / weight or 0
+end
 
-    BiteRPM = PowerMin * CLUTCH_START
-    ReleaseRPM = PowerMin
+----------------------------------------------------------------------
+-- Gear scheduling
+----------------------------------------------------------------------
+local function insertGearBySpeed(slots, speeds, count, gear, speed)
+    local slot = count + 1
+    while slot > 1 and speeds[slot - 1] > speed do
+        slots[slot]  = slots[slot - 1]
+        speeds[slot] = speeds[slot - 1]
+        slot = slot - 1
+    end
+    slots[slot]  = gear
+    speeds[slot] = speed
+    return count + 1
+end
 
-    UpshiftRPM = PowerMax * 0.95
-    DownshiftRPM = PowerMin * 0.85
+local function updateShiftSpeeds(firstSlot, count)
+    local minNextRPM = PowerMax > 0 and PowerMin / PowerMax or 0
+    for i = 0, count - 1 do
+        local slot = firstSlot + i
+        local gearSpeed = GearSpeeds[slot] or 0
+        local shift = gearSpeed * GEAR_SHIFT_MARGIN
+        local nextSpeed = GearSpeeds[slot + 1]
+        if i < count - 1 and nextSpeed then
+            -- Prefer shifting where next gear lands in its powerband, but never
+            -- past this gear's powerband-max speed; otherwise the chip lets the
+            -- engine climb past redline waiting for a shift that requires a
+            -- speed only attainable above the rev limiter.
+            shift = math.min(math.max(shift, nextSpeed * minNextRPM), gearSpeed)
+        end
+        GearShiftSpeeds[slot] = shift
+    end
+end
 
+local function selectGearSlotBySpeed(speed, minSlot, maxSlot)
+    for slot = minSlot, maxSlot do
+        if speed <= (GearShiftSpeeds[slot] or 0) then return slot end
+    end
+    return maxSlot
+end
+
+local function resolveOutputGear()
+    if OutputGearSlot <= GearCount then
+        return GearSlots[OutputGearSlot] or GearSlots[1] or 1
+    end
+    return ReverseGearSlots[OutputGearSlot - GearCount] or GearSlots[1] or 1
+end
+
+----------------------------------------------------------------------
+-- Drivetrain refresh
+----------------------------------------------------------------------
+local function resetDrivetrainState()
+    EngineStateDirty = false
+    MainWL, LeftWL, RightWL     = nil, nil, nil
+    LeftTransfer, RightTransfer = nil, nil
+    ActiveEngine                = nil
+    EngineCount, EngineWeight   = 0, 0
+    PowerMin, PowerMax          = 0, 0
+    TransferRatio               = 1
+    CanNeutralSteer             = false
+    DetectedDualClutch          = false
+    EngineReady                 = false
+    GearCount, ReverseGears     = 0, 0
+    PrevWrittenGear             = nil
+    clearArray(Engines)
+    clearArray(EngineWeights)
+    clearArray(EngineWLs)
+    clearArray(GearSpeeds)
+    clearArray(GearShiftSpeeds)
+    clearArray(GearSlots)
+    clearArray(ReverseGearSlots)
+    clearArray(ReverseGearSpeeds)
+end
+
+local function findTransfers(gearLinks)
+    local transfers = 0
+    for i = 1, #gearLinks do
+        local link = gearLinks[i]
+        if isTransferCase(link) then
+            transfers = transfers + 1
+            local y = MainGearbox:worldToLocal(link:getPos()).y
+            if INVERTED_TRANSFERS then y = -y end
+            if y < 0 then RightTransfer = link end
+            if y > 0 then LeftTransfer  = link end
+            if transfers == 1 then TransferRatio = gearboxTotalRatio(link, 1) end
+        end
+    end
+    return transfers
+end
+
+local function buildGearSchedules()
     local totalGears = MainGearbox:acfNumGears()
-    local useReciprocalRatios = false
-
-    for i = 1, totalGears do
-        local ratio = MainGearbox:acfGearRatio(i)
-        if ratio ~= 0 and math.abs(ratio) > 1 then
-            useReciprocalRatios = true
-            break
-        end
-    end
-
-    -- Driveline speed: wheel RPM = engine RPM / overall reduction, speed = wheel RPM * tire circumference.
-    -- ACF2-style ratios are already inverse reductions; ACF3-style ratios need to be inverted first.
-    local commonVal = (PowerMax * FINAL_RATIO / 60) * WHEEL_DIAMETER * math.pi
-
-    GearCount = 0
-    ReverseGears = 0
+    -- Top-of-powerband wheel surface speed in km/h for a given gear ratio.
+    local commonVal = (PowerMax / 60) * WHEEL_DIAMETER * math.pi
 
     for i = 1, totalGears do
         local ratio = MainGearbox:acfGearRatio(i)
         if ratio ~= 0 then
-            local ratioAbs = math.abs(ratio)
-            local speedAtPower = math.abs(commonVal * (useReciprocalRatios and (1 / ratioAbs) or ratioAbs) * SPEEDCONV)
-
+            local totalRatio   = gearboxTotalRatio(MainGearbox, i) * TransferRatio
+            local speedAtPower = math.abs(commonVal / totalRatio * SPEEDCONV)
             if ratio < 0 then
-                local slot = ReverseGears + 1
-                while slot > 1 and ReverseGearSpeeds[slot - 1] > speedAtPower do
-                    ReverseGearSlots[slot] = ReverseGearSlots[slot - 1]
-                    ReverseGearSpeeds[slot] = ReverseGearSpeeds[slot - 1]
-                    slot = slot - 1
-                end
-                ReverseGearSlots[slot] = i
-                ReverseGearSpeeds[slot] = speedAtPower
-                ReverseGears = ReverseGears + 1
+                ReverseGears = insertGearBySpeed(
+                    ReverseGearSlots, ReverseGearSpeeds, ReverseGears, i, speedAtPower)
             else
-                local slot = GearCount + 1
-                while slot > 1 and GearSpeeds[slot - 1] > speedAtPower do
-                    GearSlots[slot] = GearSlots[slot - 1]
-                    GearSpeeds[slot] = GearSpeeds[slot - 1]
-                    slot = slot - 1
-                end
-                GearSlots[slot] = i
-                GearSpeeds[slot] = speedAtPower
-                GearCount = GearCount + 1
+                GearCount = insertGearBySpeed(
+                    GearSlots, GearSpeeds, GearCount, i, speedAtPower)
             end
         end
     end
 
-    for i = 1, ReverseGears do
-        GearSpeeds[GearCount + i] = ReverseGearSpeeds[i]
-    end
-
-    OutputGearSlot = math.clamp(OutputGearSlot, 1, math.max(GearCount + ReverseGears, 1))
-    OutputGear = (OutputGearSlot <= GearCount and GearSlots[OutputGearSlot])
-        or ReverseGearSlots[OutputGearSlot - GearCount]
-        or GearSlots[1]
-        or 1
-    IsAutogearing = GearCount > 2
-
-    local transfers = 0
-    for i = 1, #gearLinks do
-        local link = gearLinks[i]
-        if not isValid(link) or link:getClass() == "prop_physics" then continue end
-
-        local type = link:acfType()
-        if type == "Transfer Case" or type == "Transfer" then
-            transfers = transfers + 1
-            local y = MainGearbox:worldToLocal(link:getPos()).y
-            local transferY = INVERTED_TRANSFERS and -y or y
-            if transferY < 0 then RightTransfer = link end
-            if transferY > 0 then LeftTransfer = link end
-        end
-    end
-
-    MainWL = MainGearbox:getWirelink()
-    if isValid(LeftTransfer) then
-        LeftWL = LeftTransfer:getWirelink()
-    end
-    if isValid(RightTransfer) then
-        RightWL = RightTransfer:getWirelink()
-    end
-
-    if AUTO_DETECT_INLINE_TRANSFERS and LeftWL and RightWL then
-        -- Inline transfer cases use one "Gear" input. Dual-side boxes expose "Left Gear" and "Right Gear".
-        if pcall(function() LeftWL["Gear"] = 1 end) and pcall(function() RightWL["Gear"] = 1 end) then
-            INLINE_TRANSFERS = true
-        elseif pcall(function() LeftWL["Left Gear"] = 1 end) and pcall(function() LeftWL["Right Gear"] = 1 end)
-            and pcall(function() RightWL["Left Gear"] = 1 end) and pcall(function() RightWL["Right Gear"] = 1 end) then
-            INLINE_TRANSFERS = false
-        end
-    end
-
-    CanNeutralSteer = transfers >= 2 and LeftWL ~= nil and RightWL ~= nil
-
-    if not CanNeutralSteer and MainWL then
-        DetectedDualClutch = pcall(function() MainWL["Left Brake"] = MAX_BRAKE_POWER end)
-            and pcall(function() MainWL["Right Brake"] = MAX_BRAKE_POWER end)
-            and pcall(function() MainWL["Left Clutch"] = CLUTCH_BRAKE end)
-            and pcall(function() MainWL["Right Clutch"] = CLUTCH_BRAKE end)
-    end
-
-    EngineReady = MainWL ~= nil and isValid(ActiveEngine) and (transfers < 2 or CanNeutralSteer)
+    for i = 1, ReverseGears do GearSpeeds[GearCount + i] = ReverseGearSpeeds[i] end
+    updateShiftSpeeds(1, GearCount)
+    updateShiftSpeeds(GearCount + 1, ReverseGears)
 end
 
-PrevEngine = nil
-PrevMainGearbox = nil
+local function debugPrintGearSchedule()
+    if not DEBUG_GEARS then return end
+    local ratios = {}
+    for i = 1, GearCount do ratios[i] = MainGearbox:acfGearRatio(GearSlots[i]) or 0 end
+    print("engines", EngineCount, "powerband", PowerMin, PowerMax)
+    print("main final", MainGearbox:acfFinalRatio() or 0, "transfer ratio", TransferRatio)
+    print("forward ratios", unpack(ratios))
+    print("speed schedule", unpack(GearSpeeds))
+    print("shift schedule", unpack(GearShiftSpeeds))
+end
 
-local function think()
-    Engine = Inputs.Engine:get()
-    MainGearbox = Inputs.MainGearbox:get()
-    Base = Inputs.Base:get()
-    Pod = Inputs.Pod:get()
+local function updateEngineVariables()
+    local previousEngineWLs = snapshotEngineWLs()
 
-    -- 1) Refresh cached ACF/wirelink data only when entities change or a cached entity disappears.
-    local needsRefresh = EngineStateDirty or Engine ~= PrevEngine or MainGearbox ~= PrevMainGearbox
-    if not needsRefresh then
-        needsRefresh = not isValid(MainGearbox) or not isValid(ActiveEngine) or MainWL == nil or not EngineReady
-        if not needsRefresh and CanNeutralSteer then
-            needsRefresh = not isValid(LeftTransfer) or not isValid(RightTransfer) or LeftWL == nil or RightWL == nil
-        end
-    end
-
-    if needsRefresh then
-        updateEngineVariables()
-        PrevEngine = Engine
-        PrevMainGearbox = MainGearbox
-    end
-
-    -- 2) Fail closed: no throttle, first gear, full brake/clutch.
-    if not MainGearbox or not Base or not Pod or not isValid(MainGearbox) or not isValid(Base) or not EngineReady then
-        OutputGearSlot = 1
-        OutputGear = (GearSlots[1] or ReverseGearSlots[1] or 1)
-        OutputLeftGear = FORWARD_TRANSFER_GEAR
-        OutputRightGear = FORWARD_TRANSFER_GEAR
-        OutputThrottle = 0
-        OutputLeftBrake = MAX_BRAKE_POWER
-        OutputRightBrake = MAX_BRAKE_POWER
-        OutputLeftClutch = CLUTCH_BRAKE
-        OutputRightClutch = CLUTCH_BRAKE
-        CounterSteerI = 0
-        CounterSteerPrevError = 0
-        writeOutputs()
+    resetDrivetrainState()
+    if not isGearbox(MainGearbox) then
+        stopStaleEngineWires(previousEngineWLs)
         return
     end
 
-    -- 3) Read driver intent and vehicle state.
-    local vel = Base:getVelocity()
-    local speed = math.sqrt(vel.x * vel.x + vel.y * vel.y) * SPEEDCONV
-    local rpm = ActiveEngine:acfRPM()
-    local driveDir = (Pod["W"] or 0) - (Pod["S"] or 0)
-    local steerDir = (Pod["D"] or 0) - (Pod["A"] or 0)
-    local neutralSteerEnabled = CanNeutralSteer and not HAS_WHEELS and not DISABLE_NEUTRAL_STEER
-    local brakeSteerEnabled = not HAS_WHEELS and not neutralSteerEnabled
-    local hasDriveInput = driveDir ~= 0
-    local hasSteerInput = steerDir ~= 0
-    local steerOnlyDrive = brakeSteerEnabled and not hasDriveInput and hasSteerInput
-    if steerOnlyDrive then
-        driveDir = 1
+    local gearLinks = MainGearbox:acfLinks()
+    discoverEngines(gearLinks)
+    stopStaleEngineWires(previousEngineWLs)
+    if EngineCount < 1 or EngineWeight <= 0 then return end
+
+    PowerMin   = PowerMin / EngineWeight
+    PowerMax   = PowerMax / EngineWeight
+    BiteRPM    = PowerMin * CLUTCH_START
+    ReleaseRPM = PowerMin
+
+    local transfers = findTransfers(gearLinks)
+    buildGearSchedules()
+
+    OutputGearSlot = clampValue(OutputGearSlot, 1, math.max(GearCount + ReverseGears, 1))
+    OutputGear     = resolveOutputGear()
+    -- Need at least two forward gears for autoshift; one-gear vehicles fall
+    -- through to the manual branch and just pin slot 1.
+    IsAutogearing  = GearCount > 1
+    debugPrintGearSchedule()
+
+    MainWL = MainGearbox:getWirelink()
+    if isValid(LeftTransfer)  then LeftWL  = LeftTransfer:getWirelink()  end
+    if isValid(RightTransfer) then RightWL = RightTransfer:getWirelink() end
+
+    CanNeutralSteer    = transfers >= 2 and LeftWL ~= nil and RightWL ~= nil
+    DetectedDualClutch = not CanNeutralSteer and isDualClutch(MainGearbox)
+    EngineReady        = MainWL ~= nil and enginesReady() and PowerMax > 0
+        and GearCount > 0 and (transfers < 2 or CanNeutralSteer)
+end
+
+----------------------------------------------------------------------
+-- Per-tick output stages
+----------------------------------------------------------------------
+local function applyFailClosed()
+    OutputGearSlot = 1
+    OutputGear     = GearSlots[1] or ReverseGearSlots[1] or 1
+    OutputLeftGear, OutputRightGear = FORWARD_TRANSFER_GEAR, FORWARD_TRANSFER_GEAR
+    OutputThrottle = 0
+    setBothSides(MAX_BRAKE_POWER, CLUTCH_FULL)
+    CounterSteerI, CounterSteerPrevError = 0, 0
+end
+
+local function applyIdle()
+    OutputThrottle = IDLE_THROTTLE
+    setBothSides(MAX_BRAKE_POWER, CLUTCH_FULL)
+end
+
+local function computeBrakePower(speed)
+    if not SCALE_BRAKES or speed <= 1 then return MAX_BRAKE_POWER end
+    local topSpeed = BRAKE_SPEED_GATE
+    if IsAutogearing and (GearSpeeds[GearCount] or 0) > 0 then
+        topSpeed = GearSpeeds[GearCount] / 2
     end
-    local hasInput = hasDriveInput or (neutralSteerEnabled and hasSteerInput) or steerOnlyDrive
+    return MAX_BRAKE_POWER * math.min(topSpeed / speed, 1)
+end
 
-    -- 4) Start each tick from the plain "hold still" output state, then loosen it as needed.
-    OutputLeftGear = FORWARD_TRANSFER_GEAR
-    OutputRightGear = FORWARD_TRANSFER_GEAR
+-- Soft clutch release: 1 (fully disengaged) until RPM crosses BiteRPM,
+-- 0 (fully engaged) by the time RPM reaches ReleaseRPM.
+local function clutchReleaseFromRPM(rpm)
+    local range = ReleaseRPM - BiteRPM
+    if range <= 0 then return 0 end
+    return 1 - clampValue((rpm - BiteRPM) / range, 0, 1)
+end
 
-    if not hasInput and speed < 1 and rpm < BiteRPM then
-        OutputThrottle = IDLE_THROTTLE
-        OutputLeftGear = FORWARD_TRANSFER_GEAR
-        OutputRightGear = FORWARD_TRANSFER_GEAR
-        OutputLeftBrake = MAX_BRAKE_POWER
-        OutputRightBrake = MAX_BRAKE_POWER
-        OutputLeftClutch = CLUTCH_BRAKE
-        OutputRightClutch = CLUTCH_BRAKE
-        writeOutputs()
-        return
-    end
-
-    local brakePower = MAX_BRAKE_POWER
-    if SCALE_BRAKES then
-        if IsAutogearing and GearSpeeds[GearCount] and speed > 1 then
-            brakePower = MAX_BRAKE_POWER * math.min(GearSpeeds[GearCount] / 2 / speed, 1)
-        elseif speed > 1 then
-            brakePower = MAX_BRAKE_POWER * math.min(BRAKE_SPEED_GATE / speed, 1)
-        end
-    end
-
-    local baseBrakePower = brakePower
-    if HAS_WHEELS and WHEEL_COAST_WITHOUT_THROTTLE and not hasDriveInput and speed > 1 then
-        baseBrakePower = 0
-    end
-
-    OutputLeftBrake = baseBrakePower
-    OutputRightBrake = baseBrakePower
-    OutputLeftClutch = CLUTCH_BRAKE
-    OutputRightClutch = CLUTCH_BRAKE
-
-    if hasInput then
-        OutputThrottle = 100
-        local clutchRelease = 1 - math.clamp((rpm - BiteRPM) / (ReleaseRPM - BiteRPM), 0, 1)
-        OutputLeftBrake = 0
-        OutputRightBrake = 0
-        OutputLeftClutch = clutchRelease
-        OutputRightClutch = clutchRelease
-    else
-        OutputThrottle = IDLE_THROTTLE
-    end
-
-    -- 5) Choose a logical gear slot, then map that slot to the real ACF gear number.
-    -- GearSpeeds[slot] is the theoretical speed at PowerMax. So:
-    -- predicted RPM in a candidate slot = PowerMax * current speed / slot speed.
+local function chooseGearSlot(driveDir, speed, neutralSteer)
     if driveDir == 0 then
-        if OutputGearSlot > GearCount then
-            driveDir = -1
-        else
-            driveDir = 1
-        end
+        driveDir = OutputGearSlot > GearCount and -1 or 1
     end
 
     if not IsAutogearing then
-        if neutralSteerEnabled then
+        if neutralSteer then
             OutputGearSlot = 1
         elseif driveDir < 0 and ReverseGears > 0 then
             OutputGearSlot = GearCount + 1
@@ -419,166 +568,195 @@ local function think()
             OutputGearSlot = 1
         end
     else
-        local minSlot = 1
-        local maxSlot = GearCount
-
-        if driveDir < 0 and not neutralSteerEnabled and ReverseGears > 0 then
+        local minSlot, maxSlot = 1, GearCount
+        if driveDir < 0 and not neutralSteer and ReverseGears > 0 then
             minSlot = GearCount + 1
             maxSlot = GearCount + ReverseGears
         end
-
-        if OutputGearSlot < minSlot or OutputGearSlot > maxSlot then
-            OutputGearSlot = minSlot
-        end
-
-        local slotSpeed = GearSpeeds[OutputGearSlot] or 0
-        local prevSlotSpeed = GearSpeeds[OutputGearSlot - 1] or 0
-        local nextSlotSpeed = GearSpeeds[OutputGearSlot + 1] or 0
-        local predictedRPM = slotSpeed > 0 and PowerMax * speed / slotSpeed or rpm
-        local canUpshift = OutputGearSlot < maxSlot and (nextSlotSpeed == 0 or PowerMax * speed / nextSlotSpeed > DownshiftRPM)
-        local canDownshift = OutputGearSlot > minSlot and (prevSlotSpeed == 0 or PowerMax * speed / prevSlotSpeed < UpshiftRPM)
-
-        if GEARING_TYPE == 1 then
-            if rpm > UpshiftRPM and canUpshift then
-                OutputGearSlot = OutputGearSlot + 1
-            elseif rpm < DownshiftRPM and canDownshift then
-                OutputGearSlot = OutputGearSlot - 1
-            end
-        elseif GEARING_TYPE == 2 then
-            if canUpshift and speed > slotSpeed * GEAR_UP_BUFFER then
-                OutputGearSlot = OutputGearSlot + 1
-            elseif canDownshift and speed < prevSlotSpeed * GEAR_DOWN_BUFFER then
-                OutputGearSlot = OutputGearSlot - 1
-            end
-        elseif GEARING_TYPE == 3 then
-            if canUpshift and (speed > slotSpeed * GEAR_UP_BUFFER or rpm > UpshiftRPM) then
-                OutputGearSlot = OutputGearSlot + 1
-            elseif canDownshift and predictedRPM < DownshiftRPM then
-                OutputGearSlot = OutputGearSlot - 1
-            end
-        end
+        OutputGearSlot = selectGearSlotBySpeed(speed, minSlot, maxSlot)
     end
 
-    OutputGear = (OutputGearSlot <= GearCount and GearSlots[OutputGearSlot])
-        or ReverseGearSlots[OutputGearSlot - GearCount]
-        or GearSlots[1]
-        or 1
-
-    -- 6) Steering: tracked builds brake/clutch one side; split transfers can also reverse a side.
-    if neutralSteerEnabled then
-        if not hasDriveInput and hasSteerInput then
-            if steerDir < 0 then
-                OutputLeftGear = REVERSE_TRANSFER_GEAR
-                OutputRightGear = FORWARD_TRANSFER_GEAR
-            else
-                OutputLeftGear = FORWARD_TRANSFER_GEAR
-                OutputRightGear = REVERSE_TRANSFER_GEAR
-            end
-        else
-            if driveDir < 0 then
-                OutputLeftGear = REVERSE_TRANSFER_GEAR
-                OutputRightGear = REVERSE_TRANSFER_GEAR
-            end
-
-            if steerDir < 0 then
-                OutputLeftBrake = brakePower
-                OutputRightBrake = 0
-                OutputLeftClutch = CLUTCH_TURN
-            elseif steerDir > 0 then
-                OutputLeftBrake = 0
-                OutputRightBrake = brakePower
-                OutputRightClutch = CLUTCH_TURN
-            end
-        end
-    elseif brakeSteerEnabled then
-        if CanNeutralSteer and driveDir < 0 and ReverseGears == 0 then
-            OutputLeftGear = REVERSE_TRANSFER_GEAR
-            OutputRightGear = REVERSE_TRANSFER_GEAR
-        end
-
-        if hasSteerInput and (hasDriveInput or speed > 1 or steerOnlyDrive) and
-            (CanNeutralSteer or DetectedDualClutch) then
-            local turnDir = steerDir
-            if driveDir < 0 and INVERT_REVERSE_STEER then
-                turnDir = -turnDir
-            end
-            if INVERT_BRAKE_STEER then
-                turnDir = -turnDir
-            end
-
-            if turnDir > 0 then
-                OutputRightBrake = math.max(OutputRightBrake, brakePower)
-                OutputRightClutch = math.max(OutputRightClutch, CLUTCH_TURN)
-            else
-                OutputLeftBrake = math.max(OutputLeftBrake, brakePower)
-                OutputLeftClutch = math.max(OutputLeftClutch, CLUTCH_TURN)
-            end
-        end
-    end
-
-    -- 7) Straight-line yaw correction for tracked vehicles only.
-    if not HAS_WHEELS and hasDriveInput and not hasSteerInput then
-        local yawRate = Base:getAngleVelocity().z
-        local yawAbs = math.abs(yawRate)
-
-        if yawAbs > YAW_DEADZONE then
-            local err = yawAbs
-            CounterSteerI = CounterSteerI + err * THINK_DT
-
-            local pidNorm = math.min(math.max(
-                (err / MAX_YAW_RATE) * COUNTERSTEER_STRENGTH
-                + (CounterSteerI / MAX_YAW_RATE) * COUNTERSTEER_KI
-                + ((err - CounterSteerPrevError) / THINK_DT / MAX_YAW_RATE) * COUNTERSTEER_KD,
-                0
-            ), 1)
-            CounterSteerPrevError = err
-
-            local counterSteerBrake = math.min(math.max(COUNTERSTEER_MIN_BRAKE, pidNorm * brakePower), brakePower)
-            local reverseBiteActive = false
-            if CanNeutralSteer and ACTUAL_COUNTERSTEER_ENGAGEMENT > 0 and ACTUAL_COUNTERSTEER_THRESHOLD < 1 then
-                local biteStart = ACTUAL_COUNTERSTEER_THRESHOLD
-                local biteRange = 1 - biteStart
-                local biteScale = math.clamp(ACTUAL_COUNTERSTEER_ENGAGEMENT, 0, 1)
-                local reverseBiteAmount = math.clamp((pidNorm - biteStart) / biteRange, 0, 1) * biteScale
-                reverseBiteActive = reverseBiteAmount > 0
-            end
-
-            local yawWhileDriving = yawRate * driveDir
-
-            -- Match brake steering: right correction uses the right brake, left correction uses the left brake.
-            if yawWhileDriving < 0 then
-                OutputRightBrake = math.max(OutputRightBrake, counterSteerBrake)
-                OutputRightClutch = math.max(OutputRightClutch, CLUTCH_TURN)
-                if reverseBiteActive then
-                    if OutputRightGear == FORWARD_TRANSFER_GEAR then
-                        OutputRightGear = REVERSE_TRANSFER_GEAR
-                    else
-                        OutputRightGear = FORWARD_TRANSFER_GEAR
-                    end
-                end
-            else
-                OutputLeftBrake = math.max(OutputLeftBrake, counterSteerBrake)
-                OutputLeftClutch = math.max(OutputLeftClutch, CLUTCH_TURN)
-                if reverseBiteActive then
-                    if OutputLeftGear == FORWARD_TRANSFER_GEAR then
-                        OutputLeftGear = REVERSE_TRANSFER_GEAR
-                    else
-                        OutputLeftGear = FORWARD_TRANSFER_GEAR
-                    end
-                end
-            end
-        else
-            CounterSteerI = 0
-            CounterSteerPrevError = 0
-        end
-    else
-        CounterSteerI = 0
-        CounterSteerPrevError = 0
-    end
-
-    -- 8) One write point at the end of the loop keeps wire side effects predictable.
-    writeOutputs()
+    OutputGear = resolveOutputGear()
+    return driveDir
 end
 
---- Hooks
-timer.create("AMH_mainLogicLoop", THINK_DT, 0, think)
+local function applyNeutralSteer(driveDir, steerDir, brakePower, hasDrive, hasSteer)
+    if not hasDrive and hasSteer then
+        -- Pure pivot: opposite transfer gears spin tracks in opposite directions.
+        if steerDir < 0 then
+            OutputLeftGear, OutputRightGear = REVERSE_TRANSFER_GEAR, FORWARD_TRANSFER_GEAR
+        else
+            OutputLeftGear, OutputRightGear = FORWARD_TRANSFER_GEAR, REVERSE_TRANSFER_GEAR
+        end
+        return
+    end
+
+    if driveDir < 0 then
+        OutputLeftGear, OutputRightGear = REVERSE_TRANSFER_GEAR, REVERSE_TRANSFER_GEAR
+    end
+
+    -- A -> brake left, D -> brake right.
+    if steerDir < 0 then
+        OutputLeftBrake, OutputRightBrake = brakePower, 0
+        OutputLeftClutch = CLUTCH_FULL
+    elseif steerDir > 0 then
+        OutputLeftBrake, OutputRightBrake = 0, brakePower
+        OutputRightClutch = CLUTCH_FULL
+    end
+end
+
+local function applyBrakeSteer(driveDir, steerDir, brakePower, hasDrive, hasSteer, speed, steerOnlyDrive)
+    if CanNeutralSteer and driveDir < 0 and ReverseGears == 0 then
+        OutputLeftGear, OutputRightGear = REVERSE_TRANSFER_GEAR, REVERSE_TRANSFER_GEAR
+    end
+
+    local canSteerThisTick = hasSteer
+        and (hasDrive or speed > 1 or steerOnlyDrive)
+        and (CanNeutralSteer or DetectedDualClutch)
+    if not canSteerThisTick then return end
+
+    local turnDir = steerDir
+    if driveDir < 0 and INVERT_REVERSE_STEER then turnDir = -turnDir end
+    if INVERT_BRAKE_STEER then turnDir = -turnDir end
+
+    addTurnBrake(turnDir, brakePower, CLUTCH_FULL)
+end
+
+local function applyCounterSteer(driveDir, brakePower)
+    local yawRate = Base:getAngleVelocity().z
+    local yawAbs  = math.abs(yawRate)
+
+    if yawAbs <= YAW_DEADZONE then
+        CounterSteerI, CounterSteerPrevError = 0, 0
+        return
+    end
+
+    CounterSteerI = CounterSteerI + yawAbs * THINK_DT
+    local pidNorm = clampValue(
+        (yawAbs / MAX_YAW_RATE) * COUNTERSTEER_STRENGTH
+        + (CounterSteerI / MAX_YAW_RATE) * COUNTERSTEER_KI
+        + ((yawAbs - CounterSteerPrevError) / THINK_DT / MAX_YAW_RATE) * COUNTERSTEER_KD,
+        0, 1)
+    CounterSteerPrevError = yawAbs
+
+    local correctionBrake = math.min(
+        math.max(COUNTERSTEER_MIN_BRAKE, pidNorm * brakePower),
+        brakePower)
+
+    local reverseBiteActive = false
+    if CanNeutralSteer
+        and ACTUAL_COUNTERSTEER_ENGAGEMENT > 0
+        and ACTUAL_COUNTERSTEER_THRESHOLD < 1 then
+        local biteRange  = 1 - ACTUAL_COUNTERSTEER_THRESHOLD
+        local biteScale  = clampValue(ACTUAL_COUNTERSTEER_ENGAGEMENT, 0, 1)
+        local biteAmount = clampValue((pidNorm - ACTUAL_COUNTERSTEER_THRESHOLD) / biteRange, 0, 1) * biteScale
+        reverseBiteActive = biteAmount > 0
+    end
+
+    local yawWhileDriving = yawRate * driveDir
+    if INVERT_COUNTERSTEER then yawWhileDriving = -yawWhileDriving end
+
+    -- Match brake-steer convention: right correction uses right brake.
+    if yawWhileDriving < 0 then
+        addRightSide(correctionBrake, CLUTCH_FULL)
+        if reverseBiteActive then OutputRightGear = flipTransferGear(OutputRightGear) end
+    else
+        addLeftSide(correctionBrake, CLUTCH_FULL)
+        if reverseBiteActive then OutputLeftGear = flipTransferGear(OutputLeftGear) end
+    end
+end
+
+----------------------------------------------------------------------
+-- Refresh gating
+----------------------------------------------------------------------
+local function needsDrivetrainRefresh()
+    if EngineStateDirty
+        or MainGearbox ~= PrevMainGearbox
+        or not isGearbox(MainGearbox)
+        or not enginesReady()
+        or not EngineReady
+        or MainWL == nil then
+        return true
+    end
+    if CanNeutralSteer then
+        return not isValid(LeftTransfer) or not isValid(RightTransfer)
+            or LeftWL == nil or RightWL == nil
+    end
+    return false
+end
+
+----------------------------------------------------------------------
+-- Main loop
+----------------------------------------------------------------------
+timer.create("AMH_mainLogicLoop", THINK_DT, 0, function()
+    -- 1) Refresh cached ACF/wirelink data only when inputs or cache is stale.
+    if needsDrivetrainRefresh() then
+        updateEngineVariables()
+        PrevMainGearbox = MainGearbox
+    end
+
+    -- 2) Fail closed: no throttle, fallback gear, full brake/clutch.
+    if not isGearbox(MainGearbox) or not isInputEntity(Base) or not isWirelinkAlive(Pod) or not EngineReady then
+        applyFailClosed()
+        writeOutputs()
+        return
+    end
+
+    -- 3) Read driver intent and vehicle state.
+    local vel      = Base:getVelocity()
+    local speed    = math.sqrt(vel.x * vel.x + vel.y * vel.y) * SPEEDCONV
+    local rpm      = getEngineRPM()
+    local driveDir = (Pod["W"] or 0) - (Pod["S"] or 0)
+    local steerDir = (Pod["D"] or 0) - (Pod["A"] or 0)
+
+    local neutralSteer   = CanNeutralSteer and not HAS_WHEELS and not DISABLE_NEUTRAL_STEER
+    local brakeSteer     = not HAS_WHEELS and not neutralSteer
+    local hasDrive       = driveDir ~= 0
+    local hasSteer       = steerDir ~= 0
+    -- Brake-steer chassis: pure steering also drives forward.
+    local steerOnlyDrive = brakeSteer and not hasDrive and hasSteer
+    if steerOnlyDrive then driveDir = 1 end
+    local hasInput = hasDrive or (neutralSteer and hasSteer) or steerOnlyDrive
+
+    -- 4) Reset per-tick side gears (steering branches override).
+    OutputLeftGear, OutputRightGear = FORWARD_TRANSFER_GEAR, FORWARD_TRANSFER_GEAR
+
+    -- 5) Idle-while-parked: warm engine without letting it move.
+    if not hasInput and speed < 1 and rpm < BiteRPM then
+        applyIdle()
+        writeOutputs()
+        return
+    end
+
+    -- 6) Pick brake power, then throttle + base clutch state.
+    -- No WASD input always brakes; hasInput overrides below to release.
+    local brakePower = computeBrakePower(speed)
+    setBothSides(brakePower, CLUTCH_FULL)
+
+    if hasInput then
+        OutputThrottle = 100
+        setBothSides(0, clutchReleaseFromRPM(rpm))
+    else
+        OutputThrottle = IDLE_THROTTLE
+    end
+
+    -- 7) Choose gear slot and resolve to a real ACF gear number.
+    driveDir = chooseGearSlot(driveDir, speed, neutralSteer)
+
+    -- 8) Steering.
+    if neutralSteer then
+        applyNeutralSteer(driveDir, steerDir, brakePower, hasDrive, hasSteer)
+    elseif brakeSteer then
+        applyBrakeSteer(driveDir, steerDir, brakePower, hasDrive, hasSteer, speed, steerOnlyDrive)
+    end
+
+    -- 9) Straight-line yaw correction (tracked vehicles, driving, no steer input).
+    if not HAS_WHEELS and hasDrive and not hasSteer then
+        applyCounterSteer(driveDir, brakePower)
+    else
+        CounterSteerI, CounterSteerPrevError = 0, 0
+    end
+
+    -- 10) Single write point at the end keeps wire side effects predictable.
+    writeOutputs()
+end)
