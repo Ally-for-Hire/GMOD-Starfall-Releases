@@ -6,275 +6,125 @@
 --[[
 Direct-global wire helper layered over starfall_wire_networking_interface.txt.
 
-The networking interface remains the compatibility backend. This helper changes the front-end style:
-- `updateInputs("Base:ENTITY RWR:ENTITY")` creates globals `Base` and `RWR`.
-- `updateOutputs("HitPos:VECTOR")` creates globals that write outputs when assigned on the server.
-- `networkInputs("Base RWR", interval)` chooses which input globals replicate to clients.
-- `addNetworkedVariable("TargetState", interval, {})` creates a global `TargetState`.
-- Assigning `TargetState = {...}` on the server queues the networked variable update.
-- `inputClk(name, fn)` and `netVarClk(name, fn)` keep triggers name-based.
-- NetVars are connect-send gated by default; call `enableConnectSend(false)` to restore broadcast sends.
+Wraps the backend so that:
+- `updateInputs("Base:ENTITY")` exposes `_G.Base` as a live cached input.
+- `updateOutputs("HitPos:VECTOR")` exposes `_G.HitPos`; assigning on the server
+  writes the wire output.
+- `addNetworkedVariable("Speed", 0.1, 0)` exposes `_G.Speed`; assigning on the
+  server queues a replicated update.
+- `sendEntityData("Gun", 0.2, "acfReady", "acfState")` polls each method on
+  `Inputs.Gun` and replicates the results as `_G.GunacfReady`, `_G.GunacfState`.
 
-Do not declare direct globals as `local`. Reads and writes must go through `_G`.
+Connect-send is enabled by default. Call `enableConnectSend(false)` to broadcast.
 ]]--
 
 local base = require("starfall_wire_networking_interface.txt")
-enableConnectSend(true)
 
-DirectWireValues = DirectWireValues or {}
-DirectWireRegistered = DirectWireRegistered or {}
-DirectWireNetworked = DirectWireNetworked or {}
-DirectWireKinds = DirectWireKinds or {}
-DirectWireTriggers = DirectWireTriggers or {}
-DirectWireNetVarTriggers = DirectWireNetVarTriggers or {}
-DirectWireInstalled = DirectWireInstalled or false
+DirectKinds = DirectKinds or {}
+DirectInstalled = DirectInstalled or false
+DirectNetworked = DirectNetworked or {}
+DirectSendData = DirectSendData or {}
 
 local BaseUpdateInputs = updateInputs
 local BaseUpdateOutputs = updateOutputs
 local BaseAddNetworkedVariable = addNetworkedVariable
-local BaseSetNetworkedVariableInterval = setNetworkedVariableInterval
 local BaseUpdateNetworkedVariable = updateNetworkedVariable
 
-local DEFAULT_TABLE_NAMES = {
-    "filter", "list", "data", "ids", "positions", "contacts", "targetstate", "table"
-}
-
-local DEFAULT_VECTOR_NAMES = {
-    "pos", "vel", "vector", "aim"
-}
-
-local DEFAULT_BOOL_NAMES = {
-    "active", "enabled", "ready", "lock"
-}
-
-local DEFAULT_STRING_NAMES = {
-    "name", "text", "status", "type"
-}
-
-local DEFAULT_NUMBER_NAMES = {
-    "count", "amount", "size", "armor", "state", "fov", "id"
-}
-
-local function nameContainsAny(name, patterns)
-    name = string.lower(tostring(name or ""))
-    for i = 1, #patterns do
-        if string.find(name, patterns[i]) then return true end
-    end
-    return false
-end
-
-local function defaultEntityValue()
-    local value = chip()
-    if value and value.getPos and value.getForward then return value end
-    return nil
-end
-
-local function isEntityDefaultName(name)
-    name = string.lower(tostring(name or ""))
-    if string.find(name, "ready$")
-        or string.find(name, "ammotype$")
-        or string.find(name, "ammocount$")
-        or string.find(name, "ammocountmax$")
-        or string.find(name, "magsize$")
-        or string.find(name, "armor$")
-        or string.find(name, "armormax$") then return false end
-
-    return string.find(name, "driver")
-        or string.find(name, "chair")
-        or string.find(name, "parent")
-        or string.find(name, "owner")
-        or string.find(name, "entity")
-        or string.match(name, "^gun%d*$")
-        or name == "base"
-end
-
-local function defaultForName(name)
-    local lowered = string.lower(tostring(name or ""))
-    if isEntityDefaultName(lowered) then return defaultEntityValue() end
-    if nameContainsAny(lowered, DEFAULT_TABLE_NAMES) then return {} end
-    if nameContainsAny(lowered, DEFAULT_VECTOR_NAMES) then return Vector() end
-    if string.find(lowered, "ang") or string.find(lowered, "angle") then return Angle() end
-    if nameContainsAny(lowered, DEFAULT_BOOL_NAMES) then return false end
-    if nameContainsAny(lowered, DEFAULT_STRING_NAMES) then return "" end
-    if nameContainsAny(lowered, DEFAULT_NUMBER_NAMES) then return 0 end
+local function defaultForType(portType)
+    if portType == "ENTITY" then return chip() end
+    if portType == "VECTOR" then return Vector() end
+    if portType == "ANGLE" then return Angle() end
+    if portType == "ARRAY" then return {} end
+    if portType == "STRING" then return "" end
+    if portType == "WIRELINK" then return nil end
     return 0
 end
 
-local function defaultForPort(name, portType)
-    portType = string.upper(tostring(portType or "NORMAL"))
-    if portType == "ENTITY" then return defaultEntityValue() end
-    if portType == "VECTOR" then return Vector() end
-    if portType == "ANGLE" then return Angle() end
-    if portType == "ARRAY" or portType == "TABLE" then return {} end
-    if portType == "STRING" then return "" end
-    if portType == "BOOLEAN" or portType == "BOOL" then return false end
-    if portType == "WIRELINK" then return nil end
-    return defaultForName(name)
+local function entityMethodDefault(method)
+    local m = string.lower(tostring(method or ""))
+    if string.find(m, "name", 1, true)
+        or string.find(m, "type", 1, true)
+        or string.find(m, "state", 1, true)
+        or string.find(m, "status", 1, true) then return "" end
+    if string.find(m, "ready", 1, true)
+        or string.find(m, "active", 1, true)
+        or string.find(m, "valid", 1, true)
+        or string.find(m, "enabled", 1, true) then return false end
+    if string.sub(m, 1, 6) == "getpos"
+        or string.sub(m, 1, 10) == "getforward"
+        or string.sub(m, 1, 8) == "getright"
+        or string.sub(m, 1, 5) == "getup"
+        or string.sub(m, 1, 11) == "getvelocity" then return Vector() end
+    if string.sub(m, 1, 9) == "getangles" then return Angle() end
+    return 0
 end
-
-local function parseNames(value)
-    local names = {}
-    if value == nil or value == true then
-        for name in pairs(DirectWireRegistered) do names[#names + 1] = name end
-        return names
-    end
-
-    if type(value) == "string" then
-        for token in string.gmatch(value, "[^,%s]+") do
-            local name = string.match(token, "^([^:]+)")
-            if name and name ~= "" then names[#names + 1] = name end
-        end
-        return names
-    end
-
-    if type(value) == "table" then
-        for key, name in pairs(value) do
-            if type(name) == "string" and name ~= "" then
-                names[#names + 1] = name
-            elseif type(key) == "string" and key ~= "" then
-                names[#names + 1] = key
-            end
-        end
-    end
-    return names
-end
-
-local function runDirectTriggers(store, name, value)
-    local list = store[name]
-    if not list then return end
-    for i = 1, #list do
-        xpcall(list[i], function(err) print("[SWH] trigger error: ", err) end, value, name)
-    end
-end
-
-local setDirectValue
 
 local function installGlobalAccessors()
-    if DirectWireInstalled then return end
-    DirectWireInstalled = true
+    if DirectInstalled then return end
+    DirectInstalled = true
 
     local oldMeta = getmetatable(_G) or {}
     local oldIndex = oldMeta.__index
     local oldNewIndex = oldMeta.__newindex
 
-    local kinds = DirectWireKinds
-    local values = DirectWireValues
-    local cachedInputs = InputValues
-    local cachedNetVars = NetVarValues
-
     oldMeta.__index = function(tbl, key)
-        local kind = kinds[key]
+        local kind = DirectKinds[key]
         if kind == nil then
             if type(oldIndex) == "function" then return oldIndex(tbl, key) end
             if type(oldIndex) == "table" then return oldIndex[key] end
             return nil
         end
-
-        if kind == "input" then
-            local v = cachedInputs[key]
-            if v ~= nil then return v end
-            return values[key]
-        end
-
-        if kind == "netvar" then
-            local v = cachedNetVars[key]
-            if v ~= nil then return v end
-            return values[key]
-        end
-
-        return values[key]
+        if kind == "input" then return InputValues[key] end
+        if kind == "output" then return rawget(LastOutputs, key) end
+        return NetVarValues[key]
     end
 
     oldMeta.__newindex = function(tbl, key, value)
-        if kinds[key] ~= nil then
-            setDirectValue(key, value, "assign")
+        local kind = DirectKinds[key]
+        if kind == nil then
+            if type(oldNewIndex) == "function" then oldNewIndex(tbl, key, value)
+            elseif type(oldNewIndex) == "table" then oldNewIndex[key] = value
+            else rawset(tbl, key, value) end
             return
         end
-
-        if type(oldNewIndex) == "function" then
-            oldNewIndex(tbl, key, value)
-        elseif type(oldNewIndex) == "table" then
-            oldNewIndex[key] = value
-        else
-            rawset(tbl, key, value)
+        if kind == "output" then
+            if SERVER and Outputs[key] then Outputs[key]:update(value) end
+            return
         end
+        if kind == "netvar" then
+            if SERVER then BaseUpdateNetworkedVariable(key, value) end
+            return
+        end
+        -- input: ignore assignment
     end
 
     setmetatable(_G, oldMeta)
 end
 
-local function registerDirectName(name, defaultValue, kind)
-    if type(name) ~= "string" or name == "" then return false end
+local function registerDirect(name, kind, defaultValue)
+    if type(name) ~= "string" or name == "" then return end
     installGlobalAccessors()
-
-    DirectWireRegistered[name] = true
-    DirectWireKinds[name] = kind or DirectWireKinds[name] or "value"
-    if DirectWireValues[name] == nil then DirectWireValues[name] = defaultValue end
+    if DirectKinds[name] == nil then DirectKinds[name] = kind end
     rawset(_G, name, nil)
-    return true
-end
-
-setDirectValue = function(name, value, source)
-    if not DirectWireRegistered[name] then return false end
-
-    local kind = DirectWireKinds[name]
-    DirectWireValues[name] = value
-
-    if kind == "output" and SERVER and Outputs[name] then
-        Outputs[name]:update(value)
+    if defaultValue == nil then return end
+    if DirectKinds[name] == "input" and InputValues[name] == nil then
+        InputValues[name] = defaultValue
+    elseif DirectKinds[name] == "netvar" and NetVarValues[name] == nil then
+        NetVarValues[name] = defaultValue
     end
-
-    local willNetwork = source == "assign" and SERVER and DirectWireNetworked[name] and kind ~= "output"
-    if willNetwork then
-        BaseUpdateNetworkedVariable(name, value)
-    end
-
-    if source ~= "netvar" and not willNetwork then
-        runDirectTriggers(DirectWireTriggers, name, value)
-    end
-    return true
-end
-
-function inputClk(name, callback)
-    if type(name) ~= "string" or type(callback) ~= "function" then return nil end
-    local input = Inputs[name]
-    if input and input.addTrigger then return input:addTrigger(callback) end
-
-    local list = InputTriggers[name] or {}
-    InputTriggers[name] = list
-    list[#list + 1] = callback
-    return #list
-end
-
-function netVarClk(name, callback)
-    if type(name) ~= "string" or type(callback) ~= "function" then return nil end
-    return NetVars[name]:addTrigger(callback)
-end
-
-function changedClk(name, callback)
-    if type(name) ~= "string" or type(callback) ~= "function" then return nil end
-    local list = DirectWireTriggers[name] or {}
-    DirectWireTriggers[name] = list
-    list[#list + 1] = callback
-
-    if DirectWireKinds[name] == "input" and not DirectWireTriggers["__input:" .. name] then
-        DirectWireTriggers["__input:" .. name] = true
-        inputClk(name, function(value)
-            runDirectTriggers(DirectWireTriggers, name, value)
-        end)
-    end
-
-    return #list
 end
 
 function updateInputs(str)
     local names, types, inputs = BaseUpdateInputs(str)
     for i = 1, #names do
         local name = names[i]
-        registerDirectName(name, defaultForPort(name, types[i]), "input")
-        if InputValues[name] == nil then
-            local current = inputs[name]:get()
-            if current ~= nil then InputValues[name] = current end
+        registerDirect(name, "input", defaultForType(types[i]))
+        if SERVER and DirectNetworked[name] == nil then
+            local input = Inputs[name]
+            if input then
+                input:enableNetworking(true)
+                DirectNetworked[name] = true
+            end
         end
     end
     return names, types, inputs
@@ -283,23 +133,18 @@ end
 function updateOutputs(str)
     local names, types, outputs = BaseUpdateOutputs(str)
     for i = 1, #names do
-        local name = names[i]
-        registerDirectName(name, defaultForPort(name, types[i]), "output")
+        registerDirect(names[i], "output", defaultForType(types[i]))
     end
     return names, types, outputs
 end
 
 function updateOutput(name, value)
     if type(name) ~= "string" or not Outputs[name] then return false end
-    if not DirectWireRegistered[name] then
-        registerDirectName(name, defaultForName(name), "output")
-    end
-    return setDirectValue(name, value, "output")
+    return Outputs[name]:update(value)
 end
 
 function updateOutputValues(values)
     if type(values) ~= "table" then return 0 end
-
     local count = 0
     for name, value in pairs(values) do
         if updateOutput(name, value) then count = count + 1 end
@@ -307,15 +152,40 @@ function updateOutputValues(values)
     return count
 end
 
+local function parseNames(value)
+    local names = {}
+    if value == nil or value == true then
+        for name, kind in pairs(DirectKinds) do
+            if kind == "input" then names[#names + 1] = name end
+        end
+        return names
+    end
+    if type(value) == "string" then
+        for token in string.gmatch(value, "[^,%s]+") do
+            local name = string.match(token, "^([^:]+)")
+            if name and name ~= "" then names[#names + 1] = name end
+        end
+        return names
+    end
+    if type(value) == "table" then
+        for k, v in pairs(value) do
+            if type(v) == "string" and v ~= "" then names[#names + 1] = v
+            elseif type(k) == "string" and k ~= "" then names[#names + 1] = k end
+        end
+    end
+    return names
+end
+
 function networkInputs(namesOrAll, interval)
+    if not SERVER then return 0 end
     local names = parseNames(namesOrAll)
     local count = 0
     for i = 1, #names do
-        local name = names[i]
-        local input = Inputs[name]
-        if input and input.enableNetworking then
-            DirectWireNetworked[name] = input:enableNetworking(true, interval)
-            count = count + (DirectWireNetworked[name] and 1 or 0)
+        local input = Inputs[names[i]]
+        if input then
+            input:enableNetworking(true, interval)
+            DirectNetworked[names[i]] = true
+            count = count + 1
         end
     end
     return count
@@ -326,14 +196,14 @@ function networkInput(name, interval)
 end
 
 function unnetworkInputs(namesOrAll)
+    if not SERVER then return 0 end
     local names = parseNames(namesOrAll)
     local count = 0
     for i = 1, #names do
-        local name = names[i]
-        local input = Inputs[name]
-        if input and input.enableNetworking then
+        local input = Inputs[names[i]]
+        if input then
             input:enableNetworking(false)
-            DirectWireNetworked[name] = false
+            DirectNetworked[names[i]] = false
             count = count + 1
         end
     end
@@ -343,20 +213,12 @@ end
 function addNetworkedVariable(name, interval, defaultValue)
     local entry = BaseAddNetworkedVariable(name, interval)
     if not entry then return nil end
-
     if defaultValue == nil then defaultValue = NetVarValues[name] end
-    if defaultValue == nil then defaultValue = defaultForName(name) end
-    registerDirectName(name, defaultValue, "netvar")
-    DirectWireNetworked[name] = true
-
-    if not DirectWireNetVarTriggers[name] then
-        DirectWireNetVarTriggers[name] = NetVars[name]:addTrigger(function(value)
-            DirectWireValues[name] = value
-            runDirectTriggers(DirectWireTriggers, name, value)
-        end) or true
-    end
-
-    if SERVER and defaultValue ~= nil and NetVarValues[name] == nil then
+    if defaultValue == nil then defaultValue = 0 end
+    local existingKind = DirectKinds[name]
+    local hadValue = NetVarValues[name] ~= nil
+    registerDirect(name, "netvar", defaultValue)
+    if SERVER and existingKind ~= "input" and not hadValue then
         BaseUpdateNetworkedVariable(name, defaultValue, interval)
     end
     return entry
@@ -364,26 +226,6 @@ end
 
 function networkVariable(name, interval, defaultValue)
     return addNetworkedVariable(name, interval, defaultValue)
-end
-
-function setNetworkedVariableInterval(name, interval)
-    return BaseSetNetworkedVariableInterval(name, interval)
-end
-
-function updateNetworkedVariable(name, value, interval)
-    addNetworkedVariable(name, interval, value)
-    setDirectValue(name, value, "netvar")
-    return BaseUpdateNetworkedVariable(name, value, interval)
-end
-
-function updateNetworkedVariables(values, interval)
-    if type(values) ~= "table" then return 0 end
-
-    local count = 0
-    for name, value in pairs(values) do
-        if updateNetworkedVariable(name, value, interval) then count = count + 1 end
-    end
-    return count
 end
 
 function networkVariables(valuesOrNames, interval)
@@ -400,7 +242,6 @@ function networkVariables(valuesOrNames, interval)
         end
         return count
     end
-
     local names = parseNames(valuesOrNames)
     local count = 0
     for i = 1, #names do
@@ -411,13 +252,66 @@ function networkVariables(valuesOrNames, interval)
 end
 
 function directValue(name, defaultValue)
-    return registerDirectName(name, defaultValue, "value")
+    if type(name) ~= "string" or name == "" then return false end
+    registerDirect(name, "value", defaultValue)
+    return true
 end
 
 function getDirectValue(name, fallback)
-    local value = DirectWireValues[name]
-    if value ~= nil then return value end
+    local v = NetVarValues[name]
+    if v ~= nil then return v end
+    v = InputValues[name]
+    if v ~= nil then return v end
     return fallback
 end
+
+function changedClk(name, fn)
+    if type(name) ~= "string" or type(fn) ~= "function" then return nil end
+    local kind = DirectKinds[name]
+    if kind == "input" then return inputClk(name, fn) end
+    return netVarClk(name, fn)
+end
+
+function sendEntityData(name, interval, ...)
+    if type(name) ~= "string" or name == "" then return false end
+    local methods = {}
+    for i = 1, select("#", ...) do
+        local m = select(i, ...)
+        if type(m) == "string" and m ~= "" then methods[#methods + 1] = m end
+    end
+    if #methods == 0 then return false end
+    interval = tonumber(interval) or 0
+
+    for i = 1, #methods do
+        addNetworkedVariable(name .. methods[i], interval, entityMethodDefault(methods[i]))
+    end
+
+    DirectSendData[name] = { methods = methods, interval = interval }
+
+    if SERVER then
+        local timerName = "SWH_sendData_" .. name
+        local pollInterval = interval > 0 and interval or 0.1
+        timer.create(timerName, pollInterval, 0, function()
+            local ent = InputValues[name]
+            local valid = false
+            if ent ~= nil and type(ent) ~= "number" and type(ent) ~= "string" and type(ent) ~= "boolean" then
+                local ok, r = pcall(function() return ent.isValid and ent:isValid() end)
+                valid = ok and r == true
+            end
+            for i = 1, #methods do
+                local method = methods[i]
+                if valid then
+                    local ok, v = pcall(function() return ent[method](ent) end)
+                    if ok and v ~= nil then
+                        BaseUpdateNetworkedVariable(name .. method, v, interval)
+                    end
+                end
+            end
+        end)
+    end
+    return true
+end
+
+enableConnectSend(true)
 
 return base
