@@ -1,0 +1,429 @@
+--@name Lowlag Systems Condenser
+--@author Ally for Hire / Merydian9
+--@include allylib/helpful_hud_functions.txt
+--@shared
+
+require("allylib/helpful_hud_functions.txt")
+
+local PREF = "CST_"
+local SELF = chip()
+local O = owner()
+local P = player()
+
+local METER_IN_UNITS = 39.3701
+local RWR_RANGE = 400
+
+local COL_MAIN = Color(255, 191, 0)
+local COL_RWR = Color(0, 255, 255, 255)
+local COL_MWR = Color(255, 0, 0)
+local DISPLAY_POS = {x = -800, y = 0}
+local DISP_SCALE = 1
+local ICON_SCALE = 1
+local CENTER_RADIUS = 100
+local RADAR_RADIUS = 146
+local SCREEN_ARROW_MARGIN = 35
+local UPDATE_INTERVAL = 0.1
+local RWR_TRACE_INTERVAL = 0.03
+local RWR_TRACE_DISTANCE = 80000
+local RWR_TRACE_START_OFFSET = 60
+local RWR_TRACE_CONE_DEG = 5
+local RWR_TRACE_STEPS = 24
+local RWR_HIT_HOLD_TIME = 0.4
+local NET_CONTACTS = PREF .. "contacts"
+
+local function clearArray(values)
+    for i = 1, #values do values[i] = nil end
+end
+
+local function clearTable(values)
+    for key in pairs(values) do values[key] = nil end
+end
+
+local function appendRWRAngles(angleValue, angles, traceOrigins, traceAngles, origin, traceEnabled)
+    local function appendAngle(angle)
+        angles[#angles + 1] = Angle(0, angle.y, 0)
+
+        if traceEnabled then
+            traceOrigins[#angles] = origin
+            traceAngles[#angles] = angle
+        end
+    end
+
+    local valueType = type(angleValue)
+
+    if valueType == "Angle" then
+        appendAngle(angleValue)
+        return
+    end
+
+    if valueType ~= "table" then return end
+
+    for i = 1, #angleValue do
+        if type(angleValue[i]) == "Angle" then
+            appendAngle(angleValue[i])
+        end
+    end
+end
+
+if SERVER then
+    local RWRs = {}
+    local MWRs = {}
+    
+    local AllEnts = find.all(function(ent) return ent:getOwner() == O end)
+    for i = 1, #AllEnts do
+        local entClass = AllEnts[i]:getClass()
+        local ent = AllEnts[i]
+        
+        if entClass == "ace_rwr_dir" or entClass == "acf_receiver" then
+            RWRs[#RWRs + 1] = ent
+        elseif entClass == "ace_rwr_sphere" then
+            RWRs[#RWRs + 1] = ent
+        elseif entClass == "acf_missileradar" then
+            MWRs[#MWRs + 1] = ent
+        end
+    end
+    
+    timer.create(PREF .. "rwrUpdate", UPDATE_INTERVAL, 0, function()
+        local angles = {}
+        local traceOrigins = {}
+        local traceAngles = {}
+        local positions = {}
+        local velocities = {}
+
+        for i = 1, #RWRs do
+            local rwr = RWRs[i]
+            if not isValid(rwr) then continue end
+
+            local wl = rwr:getWirelink()
+            local data = wl.Angle
+            if wl.Detected == 0 then continue end
+
+            appendRWRAngles(
+                data,
+                angles,
+                traceOrigins,
+                traceAngles,
+                rwr:getPos(),
+                rwr:getClass() == "ace_rwr_dir"
+            )
+        end
+
+        for i = 1, #MWRs do
+            if not isValid(MWRs[i]) then continue end
+            local wl = MWRs[i]:getWirelink()
+            local poses = wl.Position
+            local vels = wl.Velocity
+            if wl.Detected == 0 or type(poses) ~= "table" then continue end
+            if type(vels) ~= "table" then vels = wl.Velocities or {} end
+
+            for x = 1, #poses do
+                positions[#positions + 1] = poses[x]
+                velocities[#velocities + 1] = vels[x] or Vector()
+            end
+        end
+
+        net.start(NET_CONTACTS)
+        net.writeUInt(#angles, 16)
+        for i = 1, #angles do
+            net.writeAngle(angles[i])
+            net.writeBool(traceOrigins[i] ~= nil)
+            if traceOrigins[i] ~= nil then
+                net.writeVector(traceOrigins[i])
+                net.writeAngle(traceAngles[i])
+            end
+        end
+        net.writeUInt(#positions, 16)
+        for i = 1, #positions do
+            net.writeVector(positions[i])
+            net.writeVector(velocities[i])
+        end
+        net.send(O)
+    end)
+end
+
+if CLIENT then
+    local resx, resy = render.getResolution()
+    local x, y = resx / 2 + DISPLAY_POS.x, resy / 2 - DISPLAY_POS.y
+    local RWRAngles = {}
+    local RWRTraceOrigins = {}
+    local RWRTraceAngles = {}
+    local RWRTraceHits = {}
+    local RWRTraceHitTimes = {}
+    local MWRPoses = {}
+    local MWRVelocities = {}
+    
+    hook.add("drawhud", PREF .. "hudMain", function()
+        color(COL_RED)
+        simpleText(
+            x,
+            y - 25,
+            "DRAWING FOR THIS CHIP HAS DISABLED FOR NON-OWNERS",
+            TEXT_ALIGN.CENTER,
+            TEXT_ALIGN.CENTER
+        )
+    end)
+    
+    if P ~= O then return end
+    
+    local COL_BG = Color(0, 0, 0, 155)
+    local RT_DISP = initRT("DISP")
+    local RT_CENTER = initRT("CENTER")
+    local RT_MISSILE = initRT("MISSILE")
+    local SelfAng = 0
+    local TraceStep = 0
+
+    net.receive(NET_CONTACTS, function()
+        local rwrCount = net.readUInt(16)
+        clearArray(RWRAngles)
+        clearTable(RWRTraceOrigins)
+        clearTable(RWRTraceAngles)
+        clearTable(RWRTraceHits)
+        clearTable(RWRTraceHitTimes)
+        for i = 1, rwrCount do
+            RWRAngles[i] = net.readAngle()
+            if net.readBool() then
+                RWRTraceOrigins[i] = net.readVector()
+                RWRTraceAngles[i] = net.readAngle()
+            end
+        end
+
+        local mwrCount = net.readUInt(16)
+        clearArray(MWRPoses)
+        clearArray(MWRVelocities)
+        for i = 1, mwrCount do
+            MWRPoses[i] = net.readVector()
+            MWRVelocities[i] = net.readVector()
+        end
+    end)
+    
+    timer.create(PREF .. "updateAngles", 0.1, 0, function()
+        if not isValid(SELF) then return end
+        SelfAng = SELF:getAngles().y
+    end)
+
+    local function getTraceDirection(baseAngle, step)
+        local forward = baseAngle:getForward()
+        local right = baseAngle:getRight()
+        local up = baseAngle:getUp()
+        local phase = step % RWR_TRACE_STEPS
+        local coneRadius = math.tan(math.rad(RWR_TRACE_CONE_DEG)) * RWR_TRACE_DISTANCE
+        local radius = phase / RWR_TRACE_STEPS * coneRadius
+        local theta = step * 2.39996322973
+        local target = forward * RWR_TRACE_DISTANCE + right * math.cos(theta) * radius + up * math.sin(theta) * radius
+
+        return target:getNormalized()
+    end
+
+    local function rwrTraceFilter(ent)
+        if not isValid(ent) then return true end
+
+        return ent:getOwner() ~= O
+    end
+
+    timer.create(PREF .. "rwrTrace", RWR_TRACE_INTERVAL, 0, function()
+        TraceStep = TraceStep + 1
+
+        for i = 1, #RWRAngles do
+            local origin = RWRTraceOrigins[i]
+            local angle = RWRTraceAngles[i]
+            if type(origin) ~= "Vector" or type(angle) ~= "Angle" then continue end
+
+            local direction = getTraceDirection(angle, TraceStep + i * 7)
+            local traceData = trace.line(
+                origin + direction * RWR_TRACE_START_OFFSET,
+                origin + direction * RWR_TRACE_DISTANCE,
+                rwrTraceFilter,
+                nil,
+                nil,
+                true
+            )
+
+            if traceData.Hit and isValid(traceData.Entity) then
+                RWRTraceHits[i] = traceData.HitPos
+                RWRTraceHitTimes[i] = timer.curtime()
+            elseif timer.curtime() - (RWRTraceHitTimes[i] or 0) > RWR_HIT_HOLD_TIME then
+                RWRTraceHits[i] = nil
+            end
+        end
+    end)
+
+    local function drawMWRContact(displayX, displayY, origin, baseYaw, curPos, curVel)
+        if type(curPos) ~= "Vector" or type(curVel) ~= "Vector" then return end
+
+        local toMissile = curPos - origin
+        if toMissile:getLength() <= 0 then return end
+
+        local contactYaw = baseYaw - toMissile:getAngle().y
+        local velocityYaw = baseYaw - curVel:getAngle().y
+        local distMeters = origin:getDistance(curPos) / METER_IN_UNITS
+        local plotDist = math.min(distMeters / RWR_RANGE * RADAR_RADIUS, RADAR_RADIUS) * DISP_SCALE
+        local closing = math.max(0, curVel:getNormalized():dot((origin - curPos):getNormalized()))
+        local m = Matrix()
+
+        if closing > 0.75 then
+            m:translate(Vector(displayX, displayY, 0))
+            m:rotate(Angle(0, contactYaw, 0))
+            render.pushMatrix(m)
+                line(0, 0, 0, -plotDist + 6 * DISP_SCALE, (closing - 0.75) / 0.25 * 3 * DISP_SCALE)
+                circle(0, -plotDist, 6 * DISP_SCALE, 2 * DISP_SCALE)
+            render.popMatrix()
+            return
+        end
+
+        m:translate(Vector(displayX, displayY, 0))
+        m:rotate(Angle(0, contactYaw, 0))
+        m:translate(Vector(0, -plotDist, 0))
+        m:rotate(Angle(0, velocityYaw - contactYaw, 0))
+        render.pushMatrix(m)
+            line(0, 0, 0, -20 * DISP_SCALE, 2 * DISP_SCALE)
+            line(0, 0, -5 * DISP_SCALE, 5 * DISP_SCALE, 2 * DISP_SCALE)
+            line(0, 0, 5 * DISP_SCALE, 5 * DISP_SCALE, 2 * DISP_SCALE)
+        render.popMatrix()
+    end
+
+    local function drawScreenArrow(screenX, screenY)
+        local centerX, centerY = resx * 0.5, resy * 0.5
+        local dx, dy = screenX - centerX, screenY - centerY
+        local len = math.sqrt(dx * dx + dy * dy)
+        if len <= 0 then return end
+
+        dx, dy = dx / len, dy / len
+        local arrowX = math.clamp(screenX, SCREEN_ARROW_MARGIN, resx - SCREEN_ARROW_MARGIN)
+        local arrowY = math.clamp(screenY, SCREEN_ARROW_MARGIN, resy - SCREEN_ARROW_MARGIN)
+        local m = Matrix()
+        m:translate(Vector(centerX, centerY, 0))
+        m:rotate(Angle(0, math.deg(math.atan2(dx, -dy)) + 180, 0))
+        render.pushMatrix(m)
+            line(-15 * ICON_SCALE, CENTER_RADIUS, 0, CENTER_RADIUS + 15 * ICON_SCALE, 2 * ICON_SCALE)
+            line(15 * ICON_SCALE, CENTER_RADIUS, 0, CENTER_RADIUS + 15 * ICON_SCALE, 2 * ICON_SCALE)
+            plus(
+                0,
+                CENTER_RADIUS + 15 * ICON_SCALE,
+                5 * ICON_SCALE,
+                5 * ICON_SCALE,
+                10 * ICON_SCALE,
+                10 * ICON_SCALE,
+                2 * ICON_SCALE
+            )
+        render.popMatrix()
+        return arrowX, arrowY
+    end
+
+    local function drawRWRTraceHits()
+        for i = 1, #RWRAngles do
+            if timer.curtime() - (RWRTraceHitTimes[i] or 0) > RWR_HIT_HOLD_TIME then continue end
+
+            local hit = RWRTraceHits[i]
+            if type(hit) ~= "Vector" then continue end
+
+            local coords = hit:toScreen()
+            if not coords.visible then continue end
+
+            plus(
+                coords.x,
+                coords.y,
+                4 * ICON_SCALE,
+                4 * ICON_SCALE,
+                8 * ICON_SCALE,
+                8 * ICON_SCALE,
+                2 * ICON_SCALE
+            )
+        end
+    end
+
+    hook.add("drawhud", PREF .. "hudMain", function()
+        local yaw = render.getAngles().y - SelfAng
+        local m = Matrix()
+        m:translate(Vector(x, y, 0))
+        m:rotate(Angle(0, render.getAngles().y, 0))
+        render.pushMatrix(m)
+            color(COL_WHITE)
+            drawCenterRT(0, 0, RT_DISP)
+        render.popMatrix()
+        for i = 1, #RWRAngles do
+            local rwrAngle = RWRAngles[i]
+            if type(rwrAngle) ~= "Angle" then continue end
+
+            yaw = render.getAngles().y - rwrAngle.y
+            
+            color(COL_RWR)
+            m = Matrix()
+            m:translate(Vector(x, y, 0))
+            m:rotate(Angle(0, yaw + 180, 0))
+            render.pushMatrix(m)
+                centerRect(0, 123 / 2 * DISP_SCALE + 24 * DISP_SCALE, 2 * DISP_SCALE, 120 * DISP_SCALE)
+            render.popMatrix()
+            m = Matrix()
+            m:translate(Vector(resx / 2, resy / 2, 0))
+            m:rotate(Angle(0, yaw + 180, 0))
+            render.pushMatrix(m)
+                line(-85 * ICON_SCALE, CENTER_RADIUS, 0, CENTER_RADIUS + 25 * ICON_SCALE, 2 * ICON_SCALE)
+                line(85 * ICON_SCALE, CENTER_RADIUS, 0, CENTER_RADIUS + 25 * ICON_SCALE, 2 * ICON_SCALE)
+                plus(0, CENTER_RADIUS + 25 * ICON_SCALE, 5 * ICON_SCALE, 5 * ICON_SCALE, 10 * ICON_SCALE, 10 * ICON_SCALE, 2 * ICON_SCALE)
+            render.popMatrix()
+        end
+
+        color(COL_MWR)
+        local eyePos = render.getEyePos()
+        local eyeYaw = render.getEyeVector():getAngle().y
+        for i = 1, #MWRPoses do
+            drawMWRContact(x, y, eyePos, eyeYaw, MWRPoses[i], MWRVelocities[i] or Vector())
+            local coords = MWRPoses[i]:toScreen()
+            local arrowX, arrowY = drawScreenArrow(coords.x, coords.y)
+            if coords.visible then
+                drawCenterRT(coords.x, coords.y, RT_MISSILE)
+            elseif arrowX ~= nil then
+                drawCenterRT(arrowX, arrowY, RT_MISSILE)
+            end
+        end
+        
+        color(COL_WHITE)
+        drawCenterRT(x, y, RT_CENTER)
+
+        if #RWRAngles > 0 then color(COL_RWR) else color(COL_MAIN) end
+        circle(x, y, 25 * DISP_SCALE, 2 * DISP_SCALE)
+
+        color(COL_RWR)
+        drawRWRTraceHits()
+    end)
+    
+    hook.add("renderoffscreen", PREF .. "drawStaticElements", function()
+        local x, y = 512, 512 
+        
+        selectClearRT(RT_DISP)
+            color(COL_MAIN)
+            circle(x, y, 86 * DISP_SCALE, DISP_SCALE)
+            line(x, y + 25 * DISP_SCALE, x, y + 146 * DISP_SCALE, DISP_SCALE)
+            line(x, y - 25 * DISP_SCALE, x, y - 146 * DISP_SCALE, DISP_SCALE)
+            line(x + 25 * DISP_SCALE, y, x + 146 * DISP_SCALE, y, DISP_SCALE)
+            line(x - 25 * DISP_SCALE, y, x - 146 * DISP_SCALE, y, DISP_SCALE)
+            
+            color(COL_BG)
+            circleFilled(x, y, 150 * DISP_SCALE)
+            
+            color(COL_MAIN)
+            circle(x, y, 146 * DISP_SCALE, 2)
+            
+            color(COL_BLACK)
+            circle(x, y, 150 * DISP_SCALE, 1)
+            
+        selectClearRT(RT_CENTER)
+            color(COL_MAIN)
+            centerRect(x, y - 5, 25 * DISP_SCALE, 2 * DISP_SCALE)
+            centerRect(x, y + 7.5, 7.5 * DISP_SCALE, 2 * DISP_SCALE)
+            centerRect(x, y, 2 * DISP_SCALE, 25 * DISP_SCALE)
+
+        selectClearRT(RT_MISSILE)
+            local m = Matrix()
+            m:translate(Vector(x, y, 0))
+            m:rotate(Angle(0, 45, 0))
+            render.pushMatrix(m)
+                color(COL_BG)
+                centerRect(0, 0, 16, 16)
+                color(COL_MAIN)
+                centerRectOutline(0, 0, 14, 14, 2)
+            render.popMatrix()
+        
+        hook.remove("renderoffscreen", PREF .. "drawStaticElements")
+    end)
+end
