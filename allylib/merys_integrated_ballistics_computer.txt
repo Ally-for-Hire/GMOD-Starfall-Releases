@@ -37,12 +37,13 @@ local EPS_MV_ABS = 0.01
 local EPS_MV_REL = 1e-6
 local EPS_DRAG_ABS = 1e-6
 local EPS_DRAG_REL = 1e-4
-local EPS_MUZZLE_ABS = 0.01
+local EPS_MUZZLE_ABS = 2  -- GU; widened from 0.01 (matches lead computer) so sub-2 GU muzzle jitter no longer forces a full dataset rebuild
 local EPS_MUZZLE_REL = 1e-6
 
 local muzzleVelocity = 0
 local dragCoef = 0
 local MUZZLE_DIST = 0
+local muzzleAttachmentIndex = 0  -- cached "muzzle" attachment index, set on gun change
 local ammoType = ""
 
 local DATASET = {}
@@ -481,8 +482,15 @@ local function generateDataset()
     stepDatasetGeneration(GEN_TOKEN)
 end
 
+-- Cache the "muzzle" attachment index once per gun (set in initGun) instead of
+-- a string-keyed lookupAttachment on every computeMuzzleDistance call. Matches
+-- the lead computer; attachment indices are fixed per model so the cache is safe.
+local function updateMuzzleAttachment(gun)
+    muzzleAttachmentIndex = gun:lookupAttachment("muzzle") or 0
+end
+
 local function computeMuzzleDistance(gun)
-    local idx = gun:lookupAttachment("muzzle")
+    local idx = muzzleAttachmentIndex
     if idx and idx > 0 then
         local md = gun:getAttachment(idx)
         if md then
@@ -535,6 +543,7 @@ end
 local function initGun(value)
     UPDATE_TOKEN = UPDATE_TOKEN + 1
     VALIDGUN = false
+    muzzleAttachmentIndex = 0
     resetShooterTracking()
 
     if not isValid(value) then
@@ -548,6 +557,7 @@ local function initGun(value)
 
     VALIDGUN = true
     I.Gun = value
+    updateMuzzleAttachment(value)
     dprint("initGun: gun set, class=", value:getClass())
     updateValues(UPDATE_TOKEN)
 end
