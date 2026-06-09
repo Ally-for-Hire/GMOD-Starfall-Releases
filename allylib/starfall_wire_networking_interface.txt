@@ -54,7 +54,7 @@ _G.NetValues = NetValues
 _G.State = State
 
 local NET_MESSAGE = "SFWN_" .. chip():entIndex()
-local FLUSH_INTERVAL = 0.1
+local FLUSH_INTERVAL = 0.05
 local MAX_RECORDS_PER_FLUSH = 32
 local STATE_POLL_INTERVAL = 0.25
 local CONNECT_RETRY_INTERVAL = 0.5
