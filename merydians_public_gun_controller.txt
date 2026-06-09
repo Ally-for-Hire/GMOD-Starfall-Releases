@@ -10,7 +10,7 @@ require("allylib/simple_wire_helper.txt")
 require("allylib/merys_integrated_ballistics_computer.txt")
 
 updateInputs("Lock:NORMAL Active:NORMAL Gun:ENTITY Base:ENTITY HitPos:VECTOR LoadPitch:NORMAL")
-updateOutputs("TurretActive:NORMAL HAimPos:VECTOR VAimPos:VECTOR TTA:NORMAL")
+updateOutputs("TurretActive:NORMAL HAimPos:VECTOR VAimPos:VECTOR TTA:NORMAL FinalPos:VECTOR FinalLocal:VECTOR")
 
 CurTime = timer.curtime
 ZERO_VEC = Vector()
@@ -36,10 +36,6 @@ end
 
 hook.add("input", "SF_MPGC_Input", function(name, value)
     if name == "Lock" then
-        -- Rising-edge AND debounce (both required), matching the private
-        -- controller. The old `LastLock == 0 or ...` bypassed the debounce
-        -- because the input hook only fires on change, so LastLock was always 0
-        -- on a fresh press -> every click toggled regardless of LOCK_CLICK_DEBOUNCE.
         local lock = (value or 0) ~= 0
         local now = CurTime()
         if lock and not LastLock and now - LastLockClick >= LOCK_CLICK_DEBOUNCE then
@@ -51,10 +47,6 @@ hook.add("input", "SF_MPGC_Input", function(name, value)
     if name == "Gun" then LastGun = nil end
 end)
 
--- Load-pitch fallback aim: when the ballistic solver has no static solution,
--- point the gun along the base pitch minus the load pitch. Was duplicated in
--- both solve branches below; pulled out here (mirrors the private controller's
--- CFBA_ReloadAim helper).
 local function loadPitchAim(aimPos, gun, base, loadPitch)
     if loadPitch == nil then return aimPos end
     local origin = getGunOrigin(gun)
@@ -74,8 +66,10 @@ local function main()
 
     local gun = liveInput("Gun")
     local base = liveInput("Base")
-    local aimPos = liveInput("HitPos", ZERO_VEC)
+    local hitPos = liveInput("HitPos", ZERO_VEC)
     local loadPitch = LoadPitchWired and liveInput("LoadPitch") or nil
+    local aimPos = hitPos
+    local finalPos = hitPos
     local tta = 0
 
     if gun and gun:isValid() and gun ~= LastGun then
@@ -83,24 +77,34 @@ local function main()
         LastGun = gun
     end
 
-    if gun and gun:isValid() and base and base:isValid() and aimPos:getLength() > 0 then
+    if gun and gun:isValid() and base and base:isValid() and hitPos:getLength() > 0 then
         local solved = false
         if CFBA_SolveStatic then
-            local _, staticAimPos, staticTta = CFBA_SolveStatic(base, aimPos)
+            local staticTarget, staticAimPos, staticTta = CFBA_SolveStatic(base, hitPos)
             if hasVectorValue(staticAimPos) then
                 aimPos = staticAimPos
                 tta = staticTta
+                if hasVectorValue(staticTarget) then finalPos = staticTarget end
                 solved = true
             end
         end
         if not solved then
             aimPos = loadPitchAim(aimPos, gun, base, loadPitch)
         end
+    else
+        finalPos = ZERO_VEC
+    end
+
+    local finalLocal = ZERO_VEC
+    if gun and gun:isValid() and hasVectorValue(finalPos) then
+        finalLocal = gun:worldToLocal(finalPos)
     end
 
     Outputs.HAimPos:update(aimPos)
     Outputs.VAimPos:update(aimPos)
     Outputs.TTA:update(tta)
+    Outputs.FinalPos:update(finalPos)
+    Outputs.FinalLocal:update(finalLocal)
 end
 
 timer.create("SF_MPGC", ACTIVE_INTERVAL, 0, main)
