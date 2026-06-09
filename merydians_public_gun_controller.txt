@@ -22,7 +22,7 @@ WIRING_CHECK_INTERVAL = 0.5
 
 LastGun = nil
 Locked = false
-LastLock = 0
+LastLock = false
 LastLockClick = -1
 NextWiringCheck = 0
 LoadPitchWired = false
@@ -36,9 +36,13 @@ end
 
 hook.add("input", "SF_MPGC_Input", function(name, value)
     if name == "Lock" then
-        local lock = (value or 0) ~= 0 and 1 or 0
+        -- Rising-edge AND debounce (both required), matching the private
+        -- controller. The old `LastLock == 0 or ...` bypassed the debounce
+        -- because the input hook only fires on change, so LastLock was always 0
+        -- on a fresh press -> every click toggled regardless of LOCK_CLICK_DEBOUNCE.
+        local lock = (value or 0) ~= 0
         local now = CurTime()
-        if lock ~= 0 and (LastLock == 0 or now - LastLockClick >= LOCK_CLICK_DEBOUNCE) then
+        if lock and not LastLock and now - LastLockClick >= LOCK_CLICK_DEBOUNCE then
             Locked = not Locked
             LastLockClick = now
         end
@@ -46,6 +50,18 @@ hook.add("input", "SF_MPGC_Input", function(name, value)
     end
     if name == "Gun" then LastGun = nil end
 end)
+
+-- Load-pitch fallback aim: when the ballistic solver has no static solution,
+-- point the gun along the base pitch minus the load pitch. Was duplicated in
+-- both solve branches below; pulled out here (mirrors the private controller's
+-- CFBA_ReloadAim helper).
+local function loadPitchAim(aimPos, gun, base, loadPitch)
+    if loadPitch == nil then return aimPos end
+    local origin = getGunOrigin(gun)
+    if not origin then return aimPos end
+    local yaw = (aimPos - origin):getAngle().y
+    return origin + Angle(base:getAngles().p - loadPitch, yaw, 0):getForward() * 10000
+end
 
 local function main()
     local now = CurTime()
@@ -68,29 +84,22 @@ local function main()
     end
 
     if gun and gun:isValid() and base and base:isValid() and aimPos:getLength() > 0 then
+        local solved = false
         if CFBA_SolveStatic then
             local _, staticAimPos, staticTta = CFBA_SolveStatic(base, aimPos)
             if hasVectorValue(staticAimPos) then
                 aimPos = staticAimPos
                 tta = staticTta
-            elseif loadPitch ~= nil then
-                local origin = getGunOrigin(gun)
-                if origin then
-                    local yaw = (aimPos - origin):getAngle().y
-                    aimPos = origin + Angle(base:getAngles().p - loadPitch, yaw, 0):getForward() * 10000
-                end
+                solved = true
             end
-        elseif loadPitch ~= nil then
-            local origin = getGunOrigin(gun)
-            if origin then
-                local yaw = (aimPos - origin):getAngle().y
-                aimPos = origin + Angle(base:getAngles().p - loadPitch, yaw, 0):getForward() * 10000
-            end
+        end
+        if not solved then
+            aimPos = loadPitchAim(aimPos, gun, base, loadPitch)
         end
     end
 
-    Outputs.HAimPos:update(Vector(aimPos.x, aimPos.y, aimPos.z))
-    Outputs.VAimPos:update(Vector(aimPos.x, aimPos.y, aimPos.z))
+    Outputs.HAimPos:update(aimPos)
+    Outputs.VAimPos:update(aimPos)
     Outputs.TTA:update(tta)
 end
 
