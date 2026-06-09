@@ -4,8 +4,18 @@
 --@include allylib/general_algorithms.txt
 --@server
 
---- Version 0.16.2
+--- Version 0.17.1
 -- Sourced from https://github.com/Ally-for-Hire/gmod-starfall-projects/blob/main/ally_mobility_hours.txt
+-- Perf (0.17.1): per-tick wirelink writes now pass stable constant slot keys to
+-- updateWirelinkField, so the backend stops rebuilding a tostring(wl)..field
+-- change-cache key (string garbage) on every write. resetChanged() is called on
+-- each drivetrain refresh so a relinked wirelink isn't suppressed by a stale
+-- role-keyed value. No behavior change; writes were already value-suppressed.
+-- Predictive counter-steer: the straight-line yaw corrector now projects the
+-- hull's yaw rate forward by COUNTERSTEER_LOOKAHEAD seconds (using smoothed
+-- yaw acceleration) and corrects on that predicted value, so the brake leads
+-- the slew instead of chasing it. Set COUNTERSTEER_LOOKAHEAD = 0 to revert to
+-- the old purely reactive behavior.
 -- Death-hardening: every wirelink write is pcall-protected, because a wirelink
 -- to a dead entity throws "Object no longer valid" on any access (so an
 -- isValid(wl) probe cannot guard it -- the probe itself raises). The Pod
@@ -42,9 +52,9 @@ SPEEDCONV         = 1 / (39.3701 * 3.6)
 THINK_DT          = 0.1
 WHEEL_DIAMETER    = 19.5 * 2
 GEAR_SHIFT_MARGIN = 0.95
-IDLE_THROTTLE     = 40
+IDLE_THROTTLE     = 0
 
-MAX_BRAKE_POWER  = 100
+MAX_BRAKE_POWER  = 150
 SCALE_BRAKES     = false
 BRAKE_SPEED_GATE = 50      -- km/h
 MAX_YAW_RATE     = 240
@@ -52,17 +62,28 @@ MAX_YAW_RATE     = 240
 HAS_WHEELS                   = false
 DISABLE_NEUTRAL_STEER        = false
 INVERTED_TRANSFERS           = false   -- physical L/R transfer layout on the gearbox
-INVERT_BRAKE_STEER           = true   -- chassis is wired so default A/D feels swapped
+INVERT_BRAKE_STEER           = false   -- chassis is wired so default A/D feels swapped
 INVERT_COUNTERSTEER          = true   -- swap counter-steer side
 INVERT_REVERSE_STEER         = false  -- swap steer direction while reversing
 INLINE_TRANSFERS             = true   -- transfers expose one "Gear" field (stock ACF)
 
 -- Counter-steer only runs when driving straight (throttle, no steering input).
-YAW_DEADZONE           = 20
+YAW_DEADZONE           = 25
 COUNTERSTEER_STRENGTH  = 2     -- P gain
 COUNTERSTEER_KI        = 0     -- I gain
 COUNTERSTEER_KD        = 0.05  -- D gain (helps damp without windup)
 COUNTERSTEER_MIN_BRAKE = MAX_BRAKE_POWER / 2
+
+-- Predictive lead: project the hull's yaw rate COUNTERSTEER_LOOKAHEAD seconds
+-- ahead (using EMA-smoothed yaw acceleration) and correct on that predicted
+-- value, so the brake leads the slew instead of chasing it. A purely reactive
+-- PID always trails the actual drift; the lookahead lets it pre-empt overshoot
+-- and catch a yaw that is still building before it crosses the deadzone.
+-- ACCEL_SMOOTH is the EMA factor on yaw acceleration (1 = raw/no smoothing,
+-- lower = smoother but laggier) and tames single-tick noise at the 10 Hz tick.
+-- Set LOOKAHEAD = 0 to fall back to the old reactive behavior exactly.
+COUNTERSTEER_LOOKAHEAD    = 0.15
+COUNTERSTEER_ACCEL_SMOOTH = 0.5
 
 -- "Reverse bite": once counter-steer PID saturates, flip a transfer-side into
 -- reverse for a harder bite. THRESHOLD of 1 disables it; 0 always engages.
@@ -88,6 +109,8 @@ LeftTransfer, RightTransfer   = nil, nil
 ActiveEngine                  = nil
 Engines, EngineWeights        = {}, {}
 EngineWLs                     = {}
+EngineThrottleSlots           = {}  -- stable changed()-cache keys per engine wire
+EngineActiveSlots             = {}
 EngineCount, EngineWeight     = 0, 0
 EngineReady                   = false
 PowerMin, PowerMax            = 0, 0
@@ -112,6 +135,9 @@ OutputLeftBrake, OutputRightBrake   = MAX_BRAKE_POWER, MAX_BRAKE_POWER
 
 CounterSteerI         = 0
 CounterSteerPrevError = 0
+CounterSteerPrevYaw   = 0     -- last tick's signed yaw rate, for accel estimate
+CounterSteerYawAccel  = 0     -- EMA-smoothed yaw acceleration (deg/s^2)
+CounterSteerWarm      = false -- false until we have a prior yaw sample to diff
 
 EngineStateDirty = true
 inputClk("MainGearbox", function() EngineStateDirty = true end)
@@ -121,26 +147,33 @@ local PrevMainGearbox = nil
 ----------------------------------------------------------------------
 -- Wire writers
 ----------------------------------------------------------------------
-local function setField(wl, field, value)
+-- `slot` is a stable changed()-cache key threaded into updateWirelinkField.
+-- Without it the backend rebuilds "__wl:"..tostring(wl)..":"..field on EVERY
+-- write (two strings of garbage each tick); a constant literal slot avoids
+-- that. The key must encode the wirelink ROLE (main/L/R/engine), because e.g.
+-- LeftWL and RightWL both write "Left Brake" and would otherwise collide on a
+-- single field-keyed slot. resetChanged() on every drivetrain refresh keeps a
+-- relinked wirelink from being suppressed by a stale role-keyed value.
+local function setField(wl, field, value, slot)
     if not wl then return end
     -- A wirelink whose entity has died throws "Object no longer valid" on ANY
     -- access -- including isValid(wl) -- so a probe-then-write guard can never
     -- be made safe: the probe is what raises. pcall the write itself so a
     -- mid-tick engine/gearbox death is swallowed here and the chip drops to
     -- fail-closed on the next refresh instead of erroring the whole callback.
-    pcall(updateWirelinkField, wl, field, value)
+    pcall(updateWirelinkField, wl, field, value, slot)
 end
 
-local function setBothFields(wl, fieldA, fieldB, value)
-    setField(wl, fieldA, value)
-    setField(wl, fieldB, value)
+local function setBothFields(wl, fieldA, fieldB, value, slotA, slotB)
+    setField(wl, fieldA, value, slotA)
+    setField(wl, fieldB, value, slotB)
 end
 
-local function setSideGear(wl, gear)
+local function setSideGear(wl, gear, slotInline, slotLeft, slotRight)
     if INLINE_TRANSFERS then
-        setField(wl, "Gear", gear)
+        setField(wl, "Gear", gear, slotInline)
     else
-        setBothFields(wl, "Left Gear", "Right Gear", gear)
+        setBothFields(wl, "Left Gear", "Right Gear", gear, slotLeft, slotRight)
     end
 end
 
@@ -151,8 +184,8 @@ local function writeEngineWires(throttle, active)
     for i = 1, EngineCount do
         local wl = EngineWLs[i]
         if wl then
-            setField(wl, "Throttle", throttle)
-            setField(wl, "Active",   activeNum)
+            setField(wl, "Throttle", throttle,  EngineThrottleSlots[i])
+            setField(wl, "Active",   activeNum, EngineActiveSlots[i])
         end
     end
 end
@@ -187,7 +220,7 @@ local function writeOutputs()
     writeEngineWires(OutputThrottle, EngineReady)
 
     if not MainWL then return end
-    setField(MainWL, "Gear", OutputGear)
+    setField(MainWL, "Gear", OutputGear, "mGear")
 
     if DEBUG_GEARS and OutputGear ~= PrevWrittenGear then
         print("AMH shift -> Gear", OutputGear, "slot", OutputGearSlot, "auto", IsAutogearing)
@@ -196,20 +229,20 @@ local function writeOutputs()
 
     if CanNeutralSteer then
         if not LeftWL or not RightWL then return end
-        setBothFields(LeftWL,  "Left Brake",  "Right Brake",  OutputLeftBrake)
-        setBothFields(RightWL, "Left Brake",  "Right Brake",  OutputRightBrake)
-        setBothFields(LeftWL,  "Left Clutch", "Right Clutch", OutputLeftClutch)
-        setBothFields(RightWL, "Left Clutch", "Right Clutch", OutputRightClutch)
-        setSideGear(LeftWL,  OutputLeftGear)
-        setSideGear(RightWL, OutputRightGear)
+        setBothFields(LeftWL,  "Left Brake",  "Right Brake",  OutputLeftBrake,   "lLB", "lRB")
+        setBothFields(RightWL, "Left Brake",  "Right Brake",  OutputRightBrake,  "rLB", "rRB")
+        setBothFields(LeftWL,  "Left Clutch", "Right Clutch", OutputLeftClutch,  "lLC", "lRC")
+        setBothFields(RightWL, "Left Clutch", "Right Clutch", OutputRightClutch, "rLC", "rRC")
+        setSideGear(LeftWL,  OutputLeftGear,  "lG", "lLG", "lRG")
+        setSideGear(RightWL, OutputRightGear, "rG", "rLG", "rRG")
     elseif DetectedDualClutch then
-        setField(MainWL, "Left Brake",   OutputLeftBrake)
-        setField(MainWL, "Right Brake",  OutputRightBrake)
-        setField(MainWL, "Left Clutch",  OutputLeftClutch)
-        setField(MainWL, "Right Clutch", OutputRightClutch)
+        setField(MainWL, "Left Brake",   OutputLeftBrake,   "mLB")
+        setField(MainWL, "Right Brake",  OutputRightBrake,  "mRB")
+        setField(MainWL, "Left Clutch",  OutputLeftClutch,  "mLC")
+        setField(MainWL, "Right Clutch", OutputRightClutch, "mRC")
     else
-        setField(MainWL, "Brake",  OutputLeftBrake)
-        setField(MainWL, "Clutch", OutputLeftClutch)
+        setField(MainWL, "Brake",  OutputLeftBrake,  "mBrake")
+        setField(MainWL, "Clutch", OutputLeftClutch, "mClutch")
     end
 end
 
@@ -311,6 +344,10 @@ local function addEngine(ent)
     Engines[EngineCount]       = ent
     EngineWeights[EngineCount] = weight
     EngineWLs[EngineCount]     = wl
+    -- Precompute stable per-engine slot keys ONCE at discovery so the per-tick
+    -- engine writes don't rebuild a tostring(wl)..field cache key every tick.
+    EngineThrottleSlots[EngineCount] = "eT" .. EngineCount
+    EngineActiveSlots[EngineCount]   = "eA" .. EngineCount
     EngineWeight = EngineWeight + weight
     PowerMin = PowerMin + powerMin * weight
     PowerMax = PowerMax + powerMax * weight
@@ -422,6 +459,12 @@ local function resetDrivetrainState()
     clearArray(Engines)
     clearArray(EngineWeights)
     clearArray(EngineWLs)
+    clearArray(EngineThrottleSlots)
+    clearArray(EngineActiveSlots)
+    -- Drop the wire-write change cache so a relinked wirelink isn't suppressed
+    -- by the PREVIOUS drivetrain's cached values (slots are keyed by role, not
+    -- by wirelink identity, so they must be reset whenever the drivetrain is).
+    resetChanged()
     clearArray(GearSpeeds)
     clearArray(GearShiftSpeeds)
     clearArray(GearSlots)
@@ -523,13 +566,22 @@ end
 ----------------------------------------------------------------------
 -- Per-tick output stages
 ----------------------------------------------------------------------
+-- Clear all counter-steer PID + prediction state. Dropping CounterSteerWarm
+-- forces the next engaged tick to seed accel at 0, so a stale CounterSteerPrevYaw
+-- from before a steer/coast gap can't fabricate a huge yaw-acceleration spike.
+local function resetCounterSteer()
+    CounterSteerI, CounterSteerPrevError      = 0, 0
+    CounterSteerPrevYaw, CounterSteerYawAccel = 0, 0
+    CounterSteerWarm                          = false
+end
+
 local function applyFailClosed()
     OutputGearSlot = 1
     OutputGear     = GearSlots[1] or ReverseGearSlots[1] or 1
     OutputLeftGear, OutputRightGear = FORWARD_TRANSFER_GEAR, FORWARD_TRANSFER_GEAR
     OutputThrottle = 0
     setBothSides(MAX_BRAKE_POWER, CLUTCH_FULL)
-    CounterSteerI, CounterSteerPrevError = 0, 0
+    resetCounterSteer()
 end
 
 local function applyIdle()
@@ -624,7 +676,22 @@ end
 
 local function applyCounterSteer(driveDir, brakePower)
     local yawRate = Base:getAngleVelocity().z
-    local yawAbs  = math.abs(yawRate)
+
+    -- Predict the yaw rate COUNTERSTEER_LOOKAHEAD seconds ahead and run the
+    -- whole corrector (magnitude AND side) on that instead of the raw current
+    -- rate. Estimate yaw acceleration from the last sample, EMA-smooth it to
+    -- tame 10 Hz tick noise, then extrapolate. On the first engaged tick we
+    -- have no prior sample, so accel is forced to 0 -- otherwise a stale
+    -- CounterSteerPrevYaw from before a steer/coast gap would inject a bogus
+    -- spike. LOOKAHEAD = 0 collapses yawPredicted back to yawRate exactly.
+    local rawAccel = CounterSteerWarm and (yawRate - CounterSteerPrevYaw) / THINK_DT or 0
+    CounterSteerWarm     = true
+    CounterSteerYawAccel = CounterSteerYawAccel
+        + (rawAccel - CounterSteerYawAccel) * COUNTERSTEER_ACCEL_SMOOTH
+    CounterSteerPrevYaw  = yawRate
+
+    local yawPredicted = yawRate + CounterSteerYawAccel * COUNTERSTEER_LOOKAHEAD
+    local yawAbs       = math.abs(yawPredicted)
 
     if yawAbs <= YAW_DEADZONE then
         CounterSteerI, CounterSteerPrevError = 0, 0
@@ -653,7 +720,7 @@ local function applyCounterSteer(driveDir, brakePower)
         reverseBiteActive = biteAmount > 0
     end
 
-    local yawWhileDriving = yawRate * driveDir
+    local yawWhileDriving = yawPredicted * driveDir
     if INVERT_COUNTERSTEER then yawWhileDriving = -yawWhileDriving end
 
     -- Match brake-steer convention: right correction uses right brake.
@@ -754,7 +821,7 @@ timer.create("AMH_mainLogicLoop", THINK_DT, 0, function()
     if not HAS_WHEELS and hasDrive and not hasSteer then
         applyCounterSteer(driveDir, brakePower)
     else
-        CounterSteerI, CounterSteerPrevError = 0, 0
+        resetCounterSteer()
     end
 
     -- 10) Single write point at the end keeps wire side effects predictable.
