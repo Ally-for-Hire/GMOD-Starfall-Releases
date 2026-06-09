@@ -16,6 +16,12 @@ local OWNER = owner()
 local PLAYER = player()
 local ENT_ID = CHIP:entIndex()
 
+-- Cache hot globals as locals so the per-frame CalcView path (and the input
+-- handlers) skip the timer./trace. table lookup on every call. Pure micro-opt
+-- ported from merydians_modern_camera_chip.txt; no behavior change.
+local _curtime = timer.curtime
+local _line = trace.line
+
 local DRIVER_CHECK_INTERVAL = 0.5
 local DEFAULT_FOV = 100
 local ZOOM_FOV = 27.27
@@ -142,7 +148,7 @@ if SERVER then
     end)
 
     local function checkDriver()
-        local now = timer.curtime()
+        local now = _curtime()
         if now - LastDriverCheck < DRIVER_CHECK_INTERVAL then return end
         LastDriverCheck = now
 
@@ -190,8 +196,8 @@ if CLIENT then
     local PanMul = 1
     local ZoomHeld = false
     local CamAng = Angle()
-    local NextSend = timer.curtime()
-    local LastScroll = timer.curtime()
+    local NextSend = _curtime()
+    local LastScroll = _curtime()
 
     local calcViewHookId = ENT_ID .. " CalcView"
     local inputPressedHookId = ENT_ID .. " InputPressed"
@@ -263,11 +269,11 @@ if CLIENT then
 
             local forward = CamAng:getForward()
             local origin = parent:localToWorld(camera.relPos) + camera.worldPos - forward * camera.dist
-            local now = timer.curtime()
+            local now = _curtime()
 
             if NextSend < now then
                 NextSend = now + SEND_INTERVAL
-                local traceData = trace.line(origin, origin + forward * TRACE_LENGTH, traceFilter)
+                local traceData = _line(origin, origin + forward * TRACE_LENGTH, traceFilter)
                 local hitPos = traceData and traceData.HitPos or origin + forward * TRACE_LENGTH
                 sendState(MSG_MAIN_OUTPUTS, hitPos, forward, normalizeAngleCopy(CamAng), origin)
             end
@@ -319,7 +325,7 @@ if CLIENT then
         end)
 
         hook.add("MouseWheeled", mouseWheeledHookId, function(delta)
-            local now = timer.curtime()
+            local now = _curtime()
             if now - LastScroll < SCROLL_INTERVAL then return end
 
             FOV = clampValue(FOV / 4 ^ delta, 1, DEFAULT_FOV)
