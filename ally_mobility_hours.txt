@@ -4,8 +4,26 @@
 --@include allylib/general_algorithms.txt
 --@server
 
---- Version 0.17.1
+--- Version 0.18.1
 -- Sourced from https://github.com/Ally-for-Hire/gmod-starfall-projects/blob/main/ally_mobility_hours.txt
+-- Perf (0.18.1): cut the steady-state per-tick cost (~300us -> target sub-100us).
+-- The per-tick drivetrain checks no longer call the ACF type predicates
+-- (acfIsEngine/acfIsGearbox -- each a sandboxed ACF call that re-runs IsACFEntity
+-- and was being made 2x for the gearbox and ~2x per engine EVERY tick); the
+-- entity types can't change while the entities stay valid (a rewire/swap forces a
+-- full refresh), so enginesReady/getEngineRPM/needsDrivetrainRefresh and the
+-- fail-closed gate now check plain isValid and let updateEngineVariables remain
+-- the one authoritative type gate. isValid is localized. Separately, the ~14
+-- per-field-write pcalls in writeOutputs collapse to a single pcall around the
+-- whole write batch (setField is now a plain write); same death-recovery
+-- semantics (fail-closed next refresh), far less pcall overhead. No behavior change.
+-- Drivetrain (0.18.0): engine discovery now recurses the gearbox graph from the
+-- MainGearbox to ANY depth (not just one level), so engine -> gearbox -> ... -> CVT
+-- layouts find their engines. The product of the intermediate gearboxes' current
+-- total ratios (the engine -> CVT-input reduction) is captured as EngineUpstreamRatio
+-- and folded into the gear-speed math, so the shift schedule is correct when the
+-- engines are NOT wired straight to the CVT. EngineUpstreamRatio = 1 (unchanged
+-- behavior) when they are direct.
 -- Perf (0.17.1): per-tick wirelink writes now pass stable constant slot keys to
 -- updateWirelinkField, so the backend stops rebuilding a tostring(wl)..field
 -- change-cache key (string garbage) on every write. resetChanged() is called on
@@ -27,9 +45,10 @@
 Tracked / wheeled ACF mobility controller.
 Inputs:  MainGearbox, Base, Pod wirelink.
 Outputs: LeftWeldLatch, RightWeldLatch.
-Engines are auto-discovered from MainGearbox:acfLinks() (recursing through
-transfer cases when needed) and driven directly via their own wirelinks, so
-no Engine wire input or Throttle wire output is required.
+Engines are auto-discovered by recursively walking MainGearbox:acfLinks() through
+any depth of intermediate gearboxes / transfer cases (accumulating their ratios)
+and driven directly via their own wirelinks, so no Engine wire input or Throttle
+wire output is required.
 
 Drive convention (applied in both neutral-steer and brake-steer branches):
   A / left  -> brake / disengage the LEFT side.
@@ -40,6 +59,16 @@ or INVERT_COUNTERSTEER (yaw correction) to swap that branch's polarity.
 
 require("allylib/simple_wire_helper.txt")
 require("allylib/general_algorithms.txt")
+
+-- Hot-path localization. The per-tick drivetrain validity checks below were
+-- switched from the ACF type predicates (acfIsEngine/acfIsGearbox -- each a
+-- sandboxed ACF call that re-runs IsACFEntity internally) to plain isValid:
+-- an entity that passed the ACF type check at DISCOVERY is still that type for
+-- as long as it stays valid, and a rewire/swap of the MainGearbox input already
+-- forces a full refresh (inputClk dirty flag + the MainGearbox ~= PrevMainGearbox
+-- guard). So per tick we only need "is it still alive?", not "is it still an
+-- engine?". isValid is localized because it is now the most-called per-tick op.
+local isValid = isValid
 
 updateInputs("MainGearbox:ENTITY Base:ENTITY Pod:WIRELINK")
 updateOutputs("LeftWeldLatch:NORMAL RightWeldLatch:NORMAL")
@@ -52,23 +81,23 @@ SPEEDCONV         = 1 / (39.3701 * 3.6)
 THINK_DT          = 0.1
 WHEEL_DIAMETER    = 19.5 * 2
 GEAR_SHIFT_MARGIN = 0.95
-IDLE_THROTTLE     = 0
+IDLE_THROTTLE     = 20
 
-MAX_BRAKE_POWER  = 150
+MAX_BRAKE_POWER  = 100
 SCALE_BRAKES     = false
 BRAKE_SPEED_GATE = 50      -- km/h
 MAX_YAW_RATE     = 240
 
 HAS_WHEELS                   = false
 DISABLE_NEUTRAL_STEER        = false
-INVERTED_TRANSFERS           = false   -- physical L/R transfer layout on the gearbox
-INVERT_BRAKE_STEER           = false   -- chassis is wired so default A/D feels swapped
+INVERTED_TRANSFERS           = true   -- physical L/R transfer layout on the gearbox
+INVERT_BRAKE_STEER           = true   -- chassis is wired so default A/D feels swapped
 INVERT_COUNTERSTEER          = true   -- swap counter-steer side
 INVERT_REVERSE_STEER         = false  -- swap steer direction while reversing
 INLINE_TRANSFERS             = true   -- transfers expose one "Gear" field (stock ACF)
 
 -- Counter-steer only runs when driving straight (throttle, no steering input).
-YAW_DEADZONE           = 25
+YAW_DEADZONE           = 20
 COUNTERSTEER_STRENGTH  = 2     -- P gain
 COUNTERSTEER_KI        = 0     -- I gain
 COUNTERSTEER_KD        = 0.05  -- D gain (helps damp without windup)
@@ -92,6 +121,12 @@ ACTUAL_COUNTERSTEER_ENGAGEMENT = 1.0
 
 CLUTCH_START = 0.8 -- start releasing clutch once RPM hits PowerMin * this
 DEBUG_GEARS  = false
+-- DIAGNOSTIC: when true, the main loop times its own body with SysTime() and
+-- prints, once/sec to console: avg + max us/fire, fires/sec, and refreshes/sec.
+-- refreshes/sec ~= fires/sec means the chip is re-running the heavy drivetrain
+-- discovery EVERY tick (the expensive case); ~0 means steady state and the cost
+-- is the per-tick logic itself. Set back to false once the number is understood.
+DEBUG_PERF   = false
 
 ----------------------------------------------------------------------
 -- Constants (don't tune)
@@ -100,6 +135,9 @@ CLUTCH_FULL = 1 -- ACF clutch input: 1 disengages, 0 fully engages
 -- ACF transfer-case "Gear" field: 1 = forward, 2 = reverse.
 FORWARD_TRANSFER_GEAR = 1
 REVERSE_TRANSFER_GEAR = 2
+-- Safety bound on the recursive drivetrain walk. The visited-set already prevents
+-- cycles; this just caps pathologically deep link graphs.
+MAX_DRIVETRAIN_DEPTH  = 16
 
 ----------------------------------------------------------------------
 -- Mutable state
@@ -116,6 +154,7 @@ EngineReady                   = false
 PowerMin, PowerMax            = 0, 0
 BiteRPM, ReleaseRPM           = 0, 0
 TransferRatio                 = 1
+EngineUpstreamRatio           = nil  -- product of gearbox ratios between engine and CVT (nil -> 1)
 PrevWrittenGear               = nil  -- debug: last Gear value actually written
 
 GearSlots, ReverseGearSlots   = {}, {}
@@ -154,14 +193,16 @@ local PrevMainGearbox = nil
 -- LeftWL and RightWL both write "Left Brake" and would otherwise collide on a
 -- single field-keyed slot. resetChanged() on every drivetrain refresh keeps a
 -- relinked wirelink from being suppressed by a stale role-keyed value.
+-- A wirelink whose entity has died throws "Object no longer valid" on ANY access
+-- (including isValid(wl) -- the probe itself raises), so these writes still need
+-- pcall protection. But the pcall is now hoisted to the CALLER (writeOutputs wraps
+-- the whole tick's writes in one pcall; stopStaleEngineWires wraps its own), so a
+-- mid-tick entity death aborts the rest of that batch and the chip drops to
+-- fail-closed on the next refresh -- the same recovery the per-write pcall gave,
+-- but ~14 pcalls/tick collapse to 1. setField itself is now a plain write.
 local function setField(wl, field, value, slot)
     if not wl then return end
-    -- A wirelink whose entity has died throws "Object no longer valid" on ANY
-    -- access -- including isValid(wl) -- so a probe-then-write guard can never
-    -- be made safe: the probe is what raises. pcall the write itself so a
-    -- mid-tick engine/gearbox death is swallowed here and the chip drops to
-    -- fail-closed on the next refresh instead of erroring the whole callback.
-    pcall(updateWirelinkField, wl, field, value, slot)
+    updateWirelinkField(wl, field, value, slot)
 end
 
 local function setBothFields(wl, fieldA, fieldB, value, slotA, slotB)
@@ -179,8 +220,20 @@ end
 
 -- Drive every discovered engine via its own wirelink. The chip no longer
 -- exposes a Throttle wire output; throttle and Active are routed directly.
+--
+-- Gate: throttle is only ever 0 / 100 / IDLE and active is 0 / 1, so the pair is
+-- piecewise-constant -- it changes only when driver input transitions. With many
+-- engines (14+) the 2*N updateWirelinkField calls per tick dominate the loop even
+-- though changed() suppresses the actual wire write, because the CALL overhead is
+-- paid regardless. So skip the whole loop while (throttle, active) is unchanged;
+-- the engines already hold those values. resetDrivetrainState() clears the gate
+-- (sets LastEngineThrottle = nil) so the first write after a refresh/relink
+-- force-pushes to the rebuilt engine list (which also had resetChanged() run).
+local LastEngineThrottle, LastEngineActive = nil, nil
 local function writeEngineWires(throttle, active)
     local activeNum = active and 1 or 0
+    if throttle == LastEngineThrottle and activeNum == LastEngineActive then return end
+    LastEngineThrottle, LastEngineActive = throttle, activeNum
     for i = 1, EngineCount do
         local wl = EngineWLs[i]
         if wl then
@@ -207,25 +260,23 @@ local function stopStaleEngineWires(previousWLs)
     for i = 1, #previousWLs do
         local wl = previousWLs[i]
         if wl and not hasCurrentEngineWL(wl) then
-            setField(wl, "Throttle", 0)
-            setField(wl, "Active",   0)
+            -- setField no longer self-pcalls; a stale snapshot wirelink can point
+            -- at a dead entity, so guard each zeroing write (refresh path, rare).
+            pcall(setField, wl, "Throttle", 0)
+            pcall(setField, wl, "Active",   0)
         end
     end
 end
 
-local function writeOutputs()
-    LeftWeldLatch  = OutputLeftBrake  > 0 and 1 or 0
-    RightWeldLatch = OutputRightBrake > 0 and 1 or 0
-
+-- Every wirelink write for the tick. setField is now a plain write; this whole
+-- function is run inside ONE pcall by writeOutputs, so a mid-tick entity death
+-- aborts the rest of the batch and the chip fail-closes next refresh (same
+-- recovery as the old per-write pcall, but one pcall instead of ~14).
+local function writeWirelinkOutputs()
     writeEngineWires(OutputThrottle, EngineReady)
 
     if not MainWL then return end
     setField(MainWL, "Gear", OutputGear, "mGear")
-
-    if DEBUG_GEARS and OutputGear ~= PrevWrittenGear then
-        print("AMH shift -> Gear", OutputGear, "slot", OutputGearSlot, "auto", IsAutogearing)
-        PrevWrittenGear = OutputGear
-    end
 
     if CanNeutralSteer then
         if not LeftWL or not RightWL then return end
@@ -243,6 +294,19 @@ local function writeOutputs()
     else
         setField(MainWL, "Brake",  OutputLeftBrake,  "mBrake")
         setField(MainWL, "Clutch", OutputLeftClutch, "mClutch")
+    end
+end
+
+local function writeOutputs()
+    LeftWeldLatch  = OutputLeftBrake  > 0 and 1 or 0
+    RightWeldLatch = OutputRightBrake > 0 and 1 or 0
+
+    -- One pcall guards the whole write batch (see writeWirelinkOutputs note).
+    pcall(writeWirelinkOutputs)
+
+    if DEBUG_GEARS and OutputGear ~= PrevWrittenGear then
+        print("AMH shift -> Gear", OutputGear, "slot", OutputGearSlot, "auto", IsAutogearing)
+        PrevWrittenGear = OutputGear
     end
 end
 
@@ -319,6 +383,17 @@ local function gearboxTotalRatio(ent, gear)
     return math.abs(r)
 end
 
+-- Current effective ratio of a gearbox (current gear * final drive). Used for the
+-- intermediate gearboxes BETWEEN the engine and the CVT, which the chip does not
+-- shift -- so read their live ratio (acfTotalRatio = This.GearRatio) instead of
+-- assuming a gear. Falls back to 1 (no reduction) on an invalid/zero ratio.
+local function gearboxCurrentRatio(ent)
+    if not isValid(ent) then return 1 end
+    local r = ent:acfTotalRatio()
+    if not r or r == 0 then return 1 end
+    return math.abs(r)
+end
+
 ----------------------------------------------------------------------
 -- Engine bookkeeping
 ----------------------------------------------------------------------
@@ -355,42 +430,67 @@ local function addEngine(ent)
     if not ActiveEngine or powerMax > (ActiveEngine:acfPowerbandMax() or 0) then
         ActiveEngine = ent
     end
+
+    return true
 end
 
--- Walk MainGearbox links for engines; if none are direct, descend one level
--- through transfer cases and gearboxes so engine -> transfer -> mainGearbox
--- and engine -> gearbox -> mainGearbox layouts still discover the engines.
-local function discoverEngines(gearLinks)
-    for i = 1, #gearLinks do addEngine(gearLinks[i]) end
-    if EngineCount > 0 then return end
-    for i = 1, #gearLinks do
-        local link = gearLinks[i]
-        if isTransferCase(link) or isGearbox(link) then
-            local subLinks = link:acfLinks()
-            for j = 1, #subLinks do addEngine(subLinks[j]) end
+-- Recursively walk the gearbox graph from the MainGearbox toward the engines,
+-- crossing ANY number of intermediate gearboxes / transfer cases. `ratioToMain`
+-- is the cumulative ratio from the node we're exploring up to the MainGearbox
+-- input -- the product of the current total ratios of the gearboxes BETWEEN this
+-- node and the MainGearbox. When an engine is reached, that product is its
+-- engine -> CVT-input reduction; the first one found is captured as
+-- EngineUpstreamRatio and folded into the gear-speed math, so a drivetrain wired
+-- engine -> gearbox -> CVT reads the right wheel speed (not just engine -> CVT).
+-- Downstream L/R transfers are also walked but terminate at wheels (no engine),
+-- so they never set EngineUpstreamRatio; their ratio is captured by findTransfers.
+local function discoverEnginesFrom(node, ratioToMain, visited, depth)
+    local links = node:acfLinks()
+    for i = 1, #links do
+        local link = links[i]
+        if isEngine(link) then
+            if addEngine(link) and EngineUpstreamRatio == nil then
+                EngineUpstreamRatio = ratioToMain
+            end
+        elseif (isGearbox(link) or isTransferCase(link))
+            and not visited[link] and depth < MAX_DRIVETRAIN_DEPTH then
+            visited[link] = true
+            -- Engine RPM passes through `link` before reaching `node`, so `link`'s
+            -- current total ratio multiplies into the engine -> CVT reduction.
+            discoverEnginesFrom(link, ratioToMain * gearboxCurrentRatio(link), visited, depth + 1)
         end
     end
+end
+
+local function discoverEngines()
+    local visited = {}
+    visited[MainGearbox] = true
+    discoverEnginesFrom(MainGearbox, 1, visited, 0)
 end
 
 local function enginesReady()
     if EngineCount < 1 then return false end
     for i = 1, EngineCount do
-        if not isEngine(Engines[i]) or EngineWLs[i] == nil then return false end
+        -- isValid, not isEngine: addEngine already proved these are ACF engines.
+        -- A still-valid engine is still an engine; this runs every tick.
+        if not isValid(Engines[i]) or EngineWLs[i] == nil then return false end
     end
     return true
 end
 
+-- RPM is read once per tick and used only for clutch-release timing and the idle
+-- gate, both relative to the (weighted) powerband. Engines on a common gearbox
+-- input shaft are mechanically locked to the same RPM, so a single representative
+-- sample is accurate -- and at 14 engines, one acfRPM() instead of fourteen is the
+-- single biggest per-tick saving. ActiveEngine is the highest-powerband engine
+-- captured at discovery; fall back to the first still-valid engine if it died.
 local function getEngineRPM()
-    local rpm, weight = 0, 0
+    if isValid(ActiveEngine) then return ActiveEngine:acfRPM() or 0 end
     for i = 1, EngineCount do
         local e = Engines[i]
-        if isEngine(e) then
-            local w = EngineWeights[i] or 1
-            rpm    = rpm + (e:acfRPM() or 0) * w
-            weight = weight + w
-        end
+        if isValid(e) then return e:acfRPM() or 0 end
     end
-    return weight > 0 and rpm / weight or 0
+    return 0
 end
 
 ----------------------------------------------------------------------
@@ -451,6 +551,7 @@ local function resetDrivetrainState()
     EngineCount, EngineWeight   = 0, 0
     PowerMin, PowerMax          = 0, 0
     TransferRatio               = 1
+    EngineUpstreamRatio         = nil
     CanNeutralSteer             = false
     DetectedDualClutch          = false
     EngineReady                 = false
@@ -465,6 +566,10 @@ local function resetDrivetrainState()
     -- by the PREVIOUS drivetrain's cached values (slots are keyed by role, not
     -- by wirelink identity, so they must be reset whenever the drivetrain is).
     resetChanged()
+    -- Force the next writeEngineWires to push to the rebuilt engine list even if
+    -- (throttle, active) matches the pre-refresh value (the gate above is keyed on
+    -- the values, not on which engines exist).
+    LastEngineThrottle, LastEngineActive = nil, nil
     clearArray(GearSpeeds)
     clearArray(GearShiftSpeeds)
     clearArray(GearSlots)
@@ -496,7 +601,9 @@ local function buildGearSchedules()
     for i = 1, totalGears do
         local ratio = MainGearbox:acfGearRatio(i)
         if ratio ~= 0 then
-            local totalRatio   = gearboxTotalRatio(MainGearbox, i) * TransferRatio
+            -- engine -> [intermediate gearboxes] -> CVT(gear i) -> [transfer] -> wheel
+            local totalRatio   = (EngineUpstreamRatio or 1)
+                * gearboxTotalRatio(MainGearbox, i) * TransferRatio
             local speedAtPower = math.abs(commonVal / totalRatio * SPEEDCONV)
             if ratio < 0 then
                 ReverseGears = insertGearBySpeed(
@@ -518,7 +625,8 @@ local function debugPrintGearSchedule()
     local ratios = {}
     for i = 1, GearCount do ratios[i] = MainGearbox:acfGearRatio(GearSlots[i]) or 0 end
     print("engines", EngineCount, "powerband", PowerMin, PowerMax)
-    print("main final", MainGearbox:acfFinalRatio() or 0, "transfer ratio", TransferRatio)
+    print("main final", MainGearbox:acfFinalRatio() or 0, "transfer ratio", TransferRatio,
+        "upstream ratio", EngineUpstreamRatio or 1)
     print("forward ratios", unpack(ratios))
     print("speed schedule", unpack(GearSpeeds))
     print("shift schedule", unpack(GearShiftSpeeds))
@@ -534,7 +642,7 @@ local function updateEngineVariables()
     end
 
     local gearLinks = MainGearbox:acfLinks()
-    discoverEngines(gearLinks)
+    discoverEngines()
     stopStaleEngineWires(previousEngineWLs)
     if EngineCount < 1 or EngineWeight <= 0 then return end
 
@@ -739,7 +847,7 @@ end
 local function needsDrivetrainRefresh()
     if EngineStateDirty
         or MainGearbox ~= PrevMainGearbox
-        or not isGearbox(MainGearbox)
+        or not isValid(MainGearbox)   -- isGearbox re-check happens in updateEngineVariables
         or not enginesReady()
         or not EngineReady
         or MainWL == nil then
@@ -755,15 +863,20 @@ end
 ----------------------------------------------------------------------
 -- Main loop
 ----------------------------------------------------------------------
-timer.create("AMH_mainLogicLoop", THINK_DT, 0, function()
+-- Diagnostic counters (only touched when DEBUG_PERF). PerfRefreshes counts how
+-- many fires in the current 1s window actually ran updateEngineVariables.
+local PerfAccum, PerfMax, PerfCount, PerfRefreshes, PerfNextPrint = 0, 0, 0, 0, 0
+
+local function mainLogic()
     -- 1) Refresh cached ACF/wirelink data only when inputs or cache is stale.
     if needsDrivetrainRefresh() then
         updateEngineVariables()
         PrevMainGearbox = MainGearbox
+        if DEBUG_PERF then PerfRefreshes = PerfRefreshes + 1 end
     end
 
     -- 2) Fail closed: no throttle, fallback gear, full brake/clutch.
-    if not isGearbox(MainGearbox) or not isInputEntity(Base) or not isWirelinkAlive(Pod) or not EngineReady then
+    if not isValid(MainGearbox) or not isInputEntity(Base) or not isWirelinkAlive(Pod) or not EngineReady then
         applyFailClosed()
         writeOutputs()
         return
@@ -826,4 +939,31 @@ timer.create("AMH_mainLogicLoop", THINK_DT, 0, function()
 
     -- 10) Single write point at the end keeps wire side effects predictable.
     writeOutputs()
+end
+
+-- High-precision monotonic clock for the diagnostic. Prefer systime; fall back
+-- to realtime if this SF build doesn't expose it (both return seconds).
+local _systime = timer.systime or timer.realtime
+
+timer.create("AMH_mainLogicLoop", THINK_DT, 0, function()
+    if not DEBUG_PERF then return mainLogic() end
+
+    local t0 = _systime()
+    mainLogic()
+    local dt = _systime() - t0
+
+    PerfAccum = PerfAccum + dt
+    if dt > PerfMax then PerfMax = dt end
+    PerfCount = PerfCount + 1
+
+    local now = _systime()
+    if PerfNextPrint == 0 then PerfNextPrint = now + 1 end
+    if now >= PerfNextPrint then
+        print(string.format(
+            "AMH perf: avg %.0f us, max %.0f us, %d fires/s, %d refreshes/s, engines %d, ready %s",
+            PerfAccum / PerfCount * 1e6, PerfMax * 1e6, PerfCount, PerfRefreshes,
+            EngineCount, tostring(EngineReady)))
+        PerfAccum, PerfMax, PerfCount, PerfRefreshes = 0, 0, 0, 0
+        PerfNextPrint = now + 1
+    end
 end)
