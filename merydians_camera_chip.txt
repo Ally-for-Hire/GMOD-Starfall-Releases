@@ -5,7 +5,7 @@
 --@include allylib/simple_wire_helper.txt
 --@include allylib/general_algorithms.txt
 
--- Version 1.6.0
+-- Version 1.6.1
 -- Seat-driver camera controller. Helper owns wire, cached input reads, and NetVar sync.
 
 require("allylib/general_algorithms.txt")
@@ -27,6 +27,8 @@ local DEFAULT_FOV = 100
 local ZOOM_FOV = 27.27
 local TRACE_LENGTH = 999999
 local SEND_INTERVAL = 0.05
+local STATE_RETRY_COUNT = 3
+local CLEAR_RETRY_COUNT = 1
 local SCROLL_INTERVAL = 0.01
 local MOUSE_SCALE = 40
 
@@ -35,6 +37,10 @@ local MSG_STATE = 2
 local MSG_FOV = 3
 local NET_UPDATE = ENT_ID .. " Server Update"
 local NET_DRIVER_CLEAR = ENT_ID .. " Driver Clear"
+local VECTOR_BITS = 3 * 32
+local ANGLE_BITS = 3 * 32
+local MAIN_OUTPUT_BITS = 8 + VECTOR_BITS * 3 + ANGLE_BITS
+local SMALL_STATE_BITS = 8 + 8
 local ZERO_VECTOR = Vector()
 local ZERO_ANGLE = Angle()
 
@@ -113,8 +119,9 @@ if SERVER then
 
     local function clearPreviousDriver(ply)
         if ply == nil or ply == CHIP then return end
-        net.start(NET_DRIVER_CLEAR)
-        net.send(ply)
+        tryNetSendRetry(NET_DRIVER_CLEAR, nil, ply, nil, 0, CLEAR_RETRY_COUNT, SEND_INTERVAL, function()
+            return Driver == ply or not isValid(ply)
+        end)
     end
 
     local function setDriver(ply)
@@ -226,7 +233,22 @@ if CLIENT then
     end
 
     local function sendState(msgType, valueA, valueB, valueC, valueD)
-        net.start(NET_UPDATE)
+        local unreliable = msgType == MSG_MAIN_OUTPUTS
+        local payloadBits = unreliable and MAIN_OUTPUT_BITS or SMALL_STATE_BITS
+        local retryCount = unreliable and 0 or STATE_RETRY_COUNT
+        local shouldCancel = nil
+
+        if msgType == MSG_STATE then
+            shouldCancel = function()
+                return Mode ~= valueA
+            end
+        elseif msgType == MSG_FOV then
+            shouldCancel = function()
+                return math.round(FOV) ~= valueA
+            end
+        end
+
+        return tryNetSendRetry(NET_UPDATE, function()
             net.writeInt(msgType, 8)
 
             if msgType == MSG_MAIN_OUTPUTS then
@@ -237,7 +259,7 @@ if CLIENT then
             else
                 net.writeInt(valueA, 8)
             end
-        net.send()
+        end, nil, unreliable, payloadBits, retryCount, SEND_INTERVAL, shouldCancel)
     end
 
     local function resetCamera()
