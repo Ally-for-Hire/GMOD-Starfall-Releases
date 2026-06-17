@@ -5,21 +5,20 @@
 --[[
 Simple Starfall wire + networking backend.
 
-Provides:
-- updateInputs(str) / updateOutputs(str) for port declarations.
-- Inputs.<Name>, Outputs.<Name>, NetVars.<Name> proto tables.
-- InputValues.<Name>, NetVarValues.<Name> raw caches.
-- addNetworkedVariable / updateNetworkedVariable / updateNetworkedVariables
-  for replicated state.
-- inputClk(name, fn) / netVarClk(name, fn) name-based triggers.
-- changed(value, keep, slot, eps) / resetChanged(slot) change detection.
-- safeWireCreate / safeWireDelete / updateWirelinkField protected wire ops.
-- enableConnectSend(bool) / networkTargetSet(target) routing.
-- addStateSend / addNetworkedGunState / addNetworkedPropArmorState plus their
-  update* counterparts and State.<Prefix> readers.
+Public API
+  Ports     updateInputs(str), updateOutputs(str)
+            Inputs.<Name>, Outputs.<Name>, InputValues.<Name>
+  NetVars   addNetworkedVariable, updateNetworkedVariable, updateNetworkedVariables
+            getNetworkedVariableValue, NetVars.<Name>, NetVarValues.<Name>
+  Triggers  inputClk(name, fn), netVarClk(name, fn)
+  Change    changed(value, keep, slot, eps), resetChanged(slot)
+  Wire ops  safeWireCreate, safeWireDelete, updateWirelinkField
+  Routing   enableConnectSend(bool), networkTargetSet(target)
+  State     addNetworkedGunState, addNetworkedPropArmorState, addStateSend and
+            their update* counterparts; read back via State.<Prefix>.<Field>
 
 Design choices for stability:
-- One small net message format. No bit-budget, no streaming.
+- One small net message format. Budget preflight and retry/requeue, no streaming.
 - One server flush timer that batches dirty netvars into a single net message,
   capped at MAX_RECORDS_PER_FLUSH per tick.
 - Client announces readiness once; server sends a snapshot to that player and
@@ -27,38 +26,38 @@ Design choices for stability:
 - Default values come from the declared port type; no name heuristics.
 ]]--
 
--- Shared state
+-- Public state: tables chips and the simple_wire_helper layer read directly.
 Inputs = Inputs or {}
 Outputs = Outputs or {}
 InputValues = InputValues or {}
-InputValidity = InputValidity or {}
-InputTriggers = InputTriggers or {}
-InputTypes = InputTypes or {}
 NetVars = NetVars or {}
 NetVarValues = NetVarValues or {}
 NetValues = NetVarValues
-NetVarTriggers = NetVarTriggers or {}
 State = State or {}
-StateConfigs = StateConfigs or {}
-ConnectSendEnabled = ConnectSendEnabled or false
-ConnectSendTargets = ConnectSendTargets or {}
-ConnectSendAnnounced = ConnectSendAnnounced or false
-NetworkTargets = NetworkTargets
 
-_G.Inputs = Inputs
-_G.Outputs = Outputs
-_G.InputValues = InputValues
-_G.NetVars = NetVars
-_G.NetVarValues = NetVarValues
-_G.NetValues = NetValues
-_G.State = State
+-- Private state: bookkeeping the public API hides; not read outside this file.
+local InputValidity = {}
+local InputTriggers = {}
+local InputTypes = {}
+local NetVarTriggers = {}
+local StateConfigs = {}
+local ConnectSendEnabled = false
+local ConnectSendTargets = {}
+local ConnectSendAnnounced = false
+local NetworkTargets = nil
 
 local NET_MESSAGE = "SFWN_" .. chip():entIndex()
 local FLUSH_INTERVAL = 0.05
 local MAX_RECORDS_PER_FLUSH = 32
+local SNAPSHOT_RETRY_COUNT = 3
 local STATE_POLL_INTERVAL = 0.25
 local CONNECT_RETRY_INTERVAL = 0.5
 local CurTime = timer.curtime
+local NET_BASE_BITS = 8 * 8
+local STRING_TERM_BITS = 8
+local VECTOR_BITS = 3 * 32
+local ANGLE_BITS = 3 * 32
+local ENTITY_BITS = 16 + 32
 
 local TYPE_NIL = 0
 local TYPE_BOOL = 1
@@ -165,8 +164,52 @@ local function inferTypeCode(v)
     return TYPE_NIL
 end
 
+local function estimateStringBits(v)
+    return #tostring(v or "") * 8 + STRING_TERM_BITS
+end
+
+local estimateValueBits
+estimateValueBits = function(v, depth)
+    depth = (depth or 0) + 1
+    if depth > 8 then return 4 end
+
+    local code = inferTypeCode(v)
+    local bits = 4
+    if code == TYPE_NIL then return bits end
+    if code == TYPE_BOOL then return bits + 1 end
+    if code == TYPE_NUMBER then return bits + 64 end
+    if code == TYPE_STRING then return bits + estimateStringBits(v) end
+    if code == TYPE_VECTOR then return bits + VECTOR_BITS end
+    if code == TYPE_ANGLE then return bits + ANGLE_BITS end
+    if code == TYPE_ENTITY then return bits + ENTITY_BITS end
+
+    if code == TYPE_ARRAY then
+        local n = math.min(#v, 1024)
+        bits = bits + 16
+        for i = 1, n do bits = bits + estimateValueBits(v[i], depth) end
+        return bits
+    end
+
+    if code == TYPE_MAP then
+        local count = 0
+        for _ in pairs(v) do count = count + 1 end
+        count = math.min(count, 1024)
+
+        bits = bits + 16
+        local written = 0
+        for k, value in pairs(v) do
+            written = written + 1
+            if written > count then break end
+            bits = bits + estimateValueBits(k, depth) + estimateValueBits(value, depth)
+        end
+        return bits
+    end
+
+    return bits
+end
+
 -- changed() / resetChanged()
-ChangedSlots = ChangedSlots or {}
+local ChangedSlots = {}
 
 function changed(value, keep, slot, epsilon)
     slot = slot or "__default"
@@ -289,7 +332,7 @@ end
 
 function netVarProto:setInterval(interval)
     if not SERVER then return false end
-    return setNetworkedVariableInterval(self.name, interval)
+    return addNetworkedVariable(self.name, interval) ~= nil
 end
 
 function netVarProto:changed(keep, slot, epsilon)
@@ -394,19 +437,11 @@ function getNetworkedVariableValue(name, fallback)
     return NetVars[name]:get(fallback)
 end
 
-function addNetworkedVariableTrigger(name, fn)
-    return NetVars[name]:addTrigger(fn)
-end
-
 -- Networking targets
 function networkTargetSet(target)
     NetworkTargets = target or nil
     return true
 end
-
-function networkEnableDebug() return false end
-function networkStats() return {} end
-function minSendTime() return FLUSH_INTERVAL end
 
 local function fireTriggers(list, value, name)
     if not list then return end
@@ -533,19 +568,54 @@ local function resolveTargets()
     return true, out
 end
 
+local function estimateRecordsBits(records)
+    local bits = NET_BASE_BITS + estimateStringBits(NET_MESSAGE) + 16
+    for i = 1, #records do
+        bits = bits + estimateStringBits(records[i][1]) + estimateValueBits(records[i][2])
+    end
+    return bits
+end
+
+local function canSendRecords(records)
+    if net == nil or net.getBitsLeft == nil then return true end
+    return net.getBitsLeft() >= estimateRecordsBits(records)
+end
+
+-- Warn (throttled) when a single send eats more than HALF the remaining net
+-- budget -- a heads-up that you are networking too much / too often before it
+-- starts dropping or stalling. Just a print; never blocks the send.
+local LastBudgetWarn = 0
+local function warnHeavySend(records)
+    if net == nil or net.getBitsLeft == nil then return end
+    local budget = net.getBitsLeft()
+    if budget <= 0 then return end
+    local estBits = estimateRecordsBits(records)
+    if estBits * 2 <= budget then return end   -- under half the budget: fine
+
+    local now = (timer and timer.realtime) and timer.realtime() or 0
+    if now - LastBudgetWarn < 5 then return end   -- at most one warning / 5s
+    LastBudgetWarn = now
+    print(string.format(
+        "[SFWN] WARNING: net send is %d bits, over half the %d-bit budget -- reduce networked vars or raise their interval",
+        estBits, budget))
+end
+
 local function sendRecords(records, targetOverride)
-    if #records <= 0 then return end
+    if #records <= 0 then return true end
     local target
     if targetOverride ~= nil then
-        if not validRecipient(targetOverride) then return end
+        if not validRecipient(targetOverride) then return false, "target" end
         target = targetOverride
     else
         local ok, t = resolveTargets()
-        if not ok then return end
+        if not ok then return false, "target" end
         target = t
     end
 
-    xpcall(function()
+    if not canSendRecords(records) then return false, "budget" end
+    warnHeavySend(records)
+
+    local ok, err = xpcall(function()
         net.start(NET_MESSAGE)
         net.writeUInt(#records, 16)
         for i = 1, #records do
@@ -553,13 +623,34 @@ local function sendRecords(records, targetOverride)
             writeValue(records[i][2])
         end
         if target == nil then net.send() else net.send(target) end
-    end, function(err) print("[SFWN] send error: ", err) end)
+    end, function(err) return err end)
+
+    if not ok then
+        pcall(net.abort)
+        print("[SFWN] send error: ", err)
+        return false, err
+    end
+
+    return true
+end
+
+local sendRecordsOrRetry
+sendRecordsOrRetry = function(records, targetOverride, attempts)
+    local ok, reason = sendRecords(records, targetOverride)
+    if ok or reason ~= "budget" or (attempts or 0) <= 0 then return ok, reason end
+
+    timer.simple(FLUSH_INTERVAL, function()
+        if targetOverride ~= nil and not validRecipient(targetOverride) then return end
+        sendRecordsOrRetry(records, targetOverride, attempts - 1)
+    end)
+
+    return false, reason
 end
 
 if SERVER then
     local WireSelf = wire.self()
-    DirtyOrder = DirtyOrder or {}
-    DirtyLookup = DirtyLookup or {}
+    local DirtyOrder = {}
+    local DirtyLookup = {}
 
     local function markDirty(entry)
         if DirtyLookup[entry.name] then return end
@@ -572,11 +663,6 @@ if SERVER then
         local entry = ensureNetVar(name)
         if interval ~= nil then entry.interval = tonumber(interval) or 0 end
         return entry
-    end
-
-    function setNetworkedVariableInterval(name, interval)
-        local entry = addNetworkedVariable(name, interval)
-        return entry ~= nil
     end
 
     function updateNetworkedVariable(name, value, interval)
@@ -616,7 +702,7 @@ if SERVER then
     local function flush()
         if #DirtyOrder <= 0 then return end
         local now = CurTime()
-        local records, remaining = {}, {}
+        local records, sentEntries, remaining = {}, {}, {}
         for i = 1, #DirtyOrder do
             local entry = DirtyOrder[i]
             DirtyLookup[entry.name] = nil
@@ -627,6 +713,7 @@ if SERVER then
                     entry.dirty = false
                     entry.lastSent = now
                     records[#records + 1] = { entry.name, entry.value }
+                    sentEntries[#sentEntries + 1] = entry
                 else
                     remaining[#remaining + 1] = entry
                     DirtyLookup[entry.name] = true
@@ -634,7 +721,20 @@ if SERVER then
             end
         end
         DirtyOrder = remaining
-        if #records > 0 then sendRecords(records) end
+        if #records <= 0 then return end
+
+        local ok, reason = sendRecords(records)
+        if ok or reason ~= "budget" then return end
+
+        for i = 1, #sentEntries do
+            local entry = sentEntries[i]
+            entry.dirty = true
+            entry.lastSent = nil
+            if not DirtyLookup[entry.name] then
+                DirtyLookup[entry.name] = true
+                DirtyOrder[#DirtyOrder + 1] = entry
+            end
+        end
     end
 
     timer.create("SFWN_Flush", FLUSH_INTERVAL, 0, flush)
@@ -823,12 +923,12 @@ if SERVER then
             if entry == nil or entry.enabled ~= false then
                 records[#records + 1] = { name, clone(value) }
                 if #records >= MAX_RECORDS_PER_FLUSH then
-                    sendRecords(records, ply)
+                    sendRecordsOrRetry(records, ply, SNAPSHOT_RETRY_COUNT)
                     records = {}
                 end
             end
         end
-        if #records > 0 then sendRecords(records, ply) end
+        if #records > 0 then sendRecordsOrRetry(records, ply, SNAPSHOT_RETRY_COUNT) end
     end
 
     net.receive(NET_MESSAGE, function(_, ply)
@@ -876,7 +976,6 @@ if CLIENT then
         return count
     end
 
-    function setNetworkedVariableInterval() return true end
     function addNetworkedGunState() return true end
     function addNetworkedPropArmorState() return true end
     function addStateSend() return true end
@@ -900,6 +999,8 @@ if CLIENT then
                 if ok then
                     ConnectSendAnnounced = true
                     timer.remove("SFWN_Announce")
+                else
+                    pcall(net.abort)
                 end
             end)
         end
