@@ -21,7 +21,11 @@ Function index:
 - `sanitizeEntityInput(value, fallback)`: returns `value` when it is a valid entity, otherwise a fallback entity/value.
 - `sanitizeTraceFilter(value)`: returns a dense array containing only valid entities from a filter-like input.
 - `sanitizeText(value, maxLength, fallback)`: string conversion with optional truncation and fallback.
-- `tryNetSend(name, writer, recipient)`: protected `net.start`/write/send wrapper that returns whether the send succeeded.
+- `estimateNetBits(name, payloadBits)`: estimates Starfall net-burst bits for a named message.
+- `canNetSendBits(name, payloadBits)`: checks whether the current net burst can fit an estimated message.
+- `tryNetSend(name, writer, recipient, unreliable, payloadBits)`: protected `net.start`/write/send wrapper.
+- `tryNetSendRetry(name, writer, recipient, unreliable, payloadBits, retries, delay, shouldCancel)`:
+  budget retry wrapper.
 - `safeRunRemote(target, ...)`: protected `hook.runRemote` wrapper that returns the remote result or `nil`.
 - `getGunOrigin(gun)`: returns mass center or entity position for a valid gun.
 - `computeMuzzleDistance(gun)`: measures muzzle offset from the gun origin when available.
@@ -239,21 +243,72 @@ function sanitizeText(value, maxLength, fallback)
 end
 
 -- name: net message name
+-- payloadBits: optional estimate for fields written by writer, excluding the message name
+function estimateNetBits(name, payloadBits)
+    return 8 * 8 + (#tostring(name or "") + 1) * 8 + (tonumber(payloadBits) or 0)
+end
+
+-- name: net message name
+-- payloadBits: optional estimate for fields written by writer, excluding the message name
+function canNetSendBits(name, payloadBits)
+    if net == nil or net.getBitsLeft == nil then return true end
+    return net.getBitsLeft() >= estimateNetBits(name, payloadBits)
+end
+
+-- name: net message name
 -- writer: callback that writes payload fields
 -- recipient: optional target
-function tryNetSend(name, writer, recipient)
-    return pcall(function()
+-- unreliable: optional Starfall unreliable flag, useful for live pose/aim streams
+-- payloadBits: optional preflight bit estimate to avoid starting a message over budget
+function tryNetSend(name, writer, recipient, unreliable, payloadBits)
+    if payloadBits ~= nil and not canNetSendBits(name, payloadBits) then
+        return false, "budget"
+    end
+
+    local ok, err = pcall(function()
         net.start(name)
         if writer ~= nil then
             writer()
         end
 
-        if recipient ~= nil then
-            net.send(recipient)
-        else
-            net.send()
-        end
+        net.send(recipient, unreliable)
     end)
+
+    if not ok then
+        pcall(net.abort)
+        return false, err
+    end
+
+    return true
+end
+
+local function netRetryCancelled(shouldCancel)
+    if shouldCancel == nil then return false end
+
+    local ok, cancelled = pcall(shouldCancel)
+    if not ok then return true end
+    return cancelled == true
+end
+
+-- name/writer/recipient/unreliable/payloadBits: same arguments as tryNetSend
+-- retries: number of extra attempts after the first budget miss
+-- delay: seconds between retry attempts, defaults to 0.05
+-- shouldCancel: optional callback that returns true when the queued retry is stale
+function tryNetSendRetry(name, writer, recipient, unreliable, payloadBits, retries, delay, shouldCancel)
+    if netRetryCancelled(shouldCancel) then return false, "cancelled" end
+
+    local ok, reason = tryNetSend(name, writer, recipient, unreliable, payloadBits)
+    if ok or reason ~= "budget" then return ok, reason end
+
+    retries = math.max(math.floor(tonumber(retries) or 0), 0)
+    if retries <= 0 then return false, reason end
+
+    delay = math.max(tonumber(delay) or 0.05, 0)
+    timer.simple(delay, function()
+        tryNetSendRetry(name, writer, recipient, unreliable, payloadBits, retries - 1, delay, shouldCancel)
+    end)
+
+    return false, reason
 end
 
 -- target: remote target chip or nil for broadcast
