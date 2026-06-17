@@ -69,7 +69,13 @@ if SERVER then
     local RWRs = {}
     local MWRs = {}
     
-    local AllEnts = find.all(function(ent) return ent:getOwner() == O end)
+    -- pcall the getOwner call: some servers run a DetectionPP addon that detours
+    -- getOwner and errors (no :SteamID) on world/NPC/disconnected-owned ents. pcall
+    -- skips those safely; entities owned by O (a real player) are unaffected.
+    local AllEnts = find.all(function(ent)
+        local ok, entOwner = pcall(ent.getOwner, ent)
+        return ok and entOwner == O
+    end)
     for i = 1, #AllEnts do
         local entClass = AllEnts[i]:getClass()
         local ent = AllEnts[i]
