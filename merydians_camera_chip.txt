@@ -159,12 +159,10 @@ if SERVER then
         if now - LastDriverCheck < DRIVER_CHECK_INTERVAL then return end
         LastDriverCheck = now
 
-        local chair = Inputs.Chair:get()
-        local driver = nil
-        if chair and isValid(chair) then
-            driver = chair:getDriver()
-            if not isValid(driver) then driver = nil end
-        end
+        -- Chair may be wired to the seat directly OR to the ACF baseplate that owns
+        -- it; resolveSeatFrom handles both (baseplate -> Vehicles[1]).
+        local seat = resolveSeatFrom(Inputs.Chair:get(), CHIP)
+        local driver = seatActiveDriver(seat, CHIP)
 
         if (driver or CHIP) ~= Driver then setDriver(driver) end
     end
