@@ -12,6 +12,7 @@ Public API
             getNetworkedVariableValue, NetVars.<Name>, NetVarValues.<Name>
   Triggers  inputClk(name, fn), netVarClk(name, fn)
   Change    changed(value, keep, slot, eps), resetChanged(slot)
+            Omitted slots auto-key call sites, with helper direct-value fallback.
   Wire ops  safeWireCreate, safeWireDelete, updateWirelinkField
   Routing   enableConnectSend(bool), networkTargetSet(target)
   State     addNetworkedGunState, addNetworkedPropArmorState, addStateSend and
@@ -210,9 +211,59 @@ end
 
 -- changed() / resetChanged()
 local ChangedSlots = {}
+local ChangedCallFrame = nil
+local ChangedCallCounts = {}
+
+local function isDirectSlotCandidate(value)
+    local t = type(value)
+    return t == "table" or isVector(value) or isAngle(value) or ENTITY_TYPES[t] == true
+end
+
+local function changedSlotFromTable(values, prefix, value)
+    if not isDirectSlotCandidate(value) or type(values) ~= "table" then return nil end
+    local match = nil
+    for name, stored in pairs(values) do
+        if stored == value then
+            if match ~= nil then return nil end
+            match = name
+        end
+    end
+    if match == nil then return nil end
+    return prefix .. tostring(match)
+end
+
+local function changedSlotFromHelperValue(value)
+    local slot = changedSlotFromTable(InputValues, "__input:", value)
+    if slot then return slot end
+    slot = changedSlotFromTable(NetVarValues, "__netvar:", value)
+    if slot then return slot end
+    return changedSlotFromTable(LastOutputs, "__output:", value)
+end
+
+local function changedSlotFromCallsite()
+    if type(debug) ~= "table" or type(debug.getinfo) ~= "function" then return nil end
+    local ok, info = pcall(debug.getinfo, 4, "Sl")
+    if not ok or type(info) ~= "table" then return nil end
+    local src = info.short_src or info.source or "?"
+    local key = tostring(src) .. ":" .. tostring(info.currentline or 0)
+    local now = CurTime()
+    if ChangedCallFrame ~= now then
+        ChangedCallFrame = now
+        ChangedCallCounts = {}
+    end
+    local count = (ChangedCallCounts[key] or 0) + 1
+    ChangedCallCounts[key] = count
+    return "__call:" .. key .. ":" .. count
+end
+
+local function defaultChangedSlot(value)
+    return changedSlotFromCallsite()
+        or changedSlotFromHelperValue(value)
+        or ("__default:" .. tostring(type(value)))
+end
 
 function changed(value, keep, slot, epsilon)
-    slot = slot or "__default"
+    slot = slot or defaultChangedSlot(value)
     local prev = ChangedSlots[slot]
     local didChange
     if epsilon and type(value) == "number" and type(prev) == "number" then
