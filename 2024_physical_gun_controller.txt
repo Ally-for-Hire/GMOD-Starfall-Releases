@@ -8,6 +8,7 @@ require("allylib/general_algorithms.txt")
 require("allylib/simple_wire_helper.txt")
 
 updateInputs("Aimer:ENTITY HitPos:VECTOR R:NORMAL TargetPos:VECTOR LeadPos:VECTOR TargetName:STRING")
+unnetworkInputs(true)
 updateOutputs("GunTarget:VECTOR")
 
 DT = game.getTickInterval()

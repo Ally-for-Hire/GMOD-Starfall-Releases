@@ -71,6 +71,7 @@ require("allylib/general_algorithms.txt")
 local isValid = isValid
 
 updateInputs("MainGearbox:ENTITY Base:ENTITY Pod:WIRELINK")
+unnetworkInputs(true)
 updateOutputs("LeftWeldLatch:NORMAL RightWeldLatch:NORMAL")
 
 ----------------------------------------------------------------------

@@ -70,6 +70,7 @@ if SERVER then
     local LastDriverCheck = 0
 
     updateInputs("Chair:ENTITY MainParent:ENTITY SecondaryParent:ENTITY TertiaryParent:ENTITY Filter:ARRAY")
+    unnetworkInputs(true)
     updateOutputs(
         "HitPos:VECTOR CamDir:VECTOR CamAng:ANGLE CamPos:VECTOR " ..
         "CamState:NORMAL CamFOV:NORMAL CamActive:NORMAL"

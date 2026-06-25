@@ -10,6 +10,7 @@ require("allylib/simple_wire_helper.txt")
 require("allylib/merys_integrated_ballistics_computer.txt")
 
 updateInputs("Lock:NORMAL Active:NORMAL Gun:ENTITY Base:ENTITY HitPos:VECTOR LoadPitch:NORMAL")
+unnetworkInputs(true)
 updateOutputs("TurretActive:NORMAL HAimPos:VECTOR VAimPos:VECTOR TTA:NORMAL FinalPos:VECTOR FinalLocal:VECTOR")
 
 CurTime = timer.curtime

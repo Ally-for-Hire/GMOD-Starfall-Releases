@@ -18,6 +18,7 @@ local P = player()
 
 if SERVER then
     updateInputs("Base:ENTITY RWR:ENTITY RWR_Angles:ARRAY MWR_Positions:ARRAY MWR_Velocities:array WEP:ENTITY HORZ:ENTITY WYPT:ENTITY")
+    unnetworkInputs(true)
 
     local function syncMWRContacts(ply)
         local positions = InputValues.MWR_Positions

@@ -8,6 +8,7 @@ require("allylib/simple_wire_helper.txt")
 require("allylib/general_algorithms.txt")
 
 updateInputs("Radar1:entity Poll1:array Radar2:entity Poll2:array Radar3:entity Poll3:array Radar4:entity Poll4:array")
+unnetworkInputs(true)
 updateOutputs("Position:ARRAY Velocity:ARRAY Owner:ARRAY IDs:ARRAY Times:ARRAY")
 
 SELF = chip()
