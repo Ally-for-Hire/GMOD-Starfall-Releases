@@ -1,5 +1,6 @@
---- General Algorithms 
--- By Merydian9 / Ally for Hire
+--@name General Algorithms
+--@author Merydian9 / Ally for Hire
+--@shared
 -- A general collection of algorithms and functions for use in many situations
 
 --[[
@@ -19,6 +20,9 @@ Function index:
 - `asArray(value)`: returns the table unchanged or `{}` when the value is not a table.
 - `normalizeAngleCopy(ang)`: returns a copied angle normalized to the `[-180, 180]` range.
 - `sanitizeEntityInput(value, fallback)`: returns `value` when it is a valid entity, otherwise a fallback entity/value.
+- `resolveBaseplateSeat(base, self)`: server-side; resolves an ACF baseplate to its seat via the `Vehicles` wirelink output.
+- `resolveSeatFrom(ent, self)`: server-side; returns a usable seat for a Chair/Seat/Base input wired to a seat OR an ACF baseplate.
+- `seatActiveDriver(seat, self)`: returns a resolved seat's driver (or nil), guarding the `getDriver` call against non-vehicle seats.
 - `sanitizeTraceFilter(value)`: returns a dense array containing only valid entities from a filter-like input.
 - `sanitizeText(value, maxLength, fallback)`: string conversion with optional truncation and fallback.
 - `estimateNetBits(name, payloadBits)`: estimates Starfall net-burst bits for a named message.
@@ -211,6 +215,57 @@ function sanitizeEntityInput(value, fallback)
     end
 
     return fallback
+end
+
+-- Seat/driver resolution (server-authoritative; the modern camera chip's chair
+-- logic, extracted so every chip shares one definition). A Chair/Seat input may be
+-- wired to the seat/pod directly OR to the ACF baseplate that owns it. Only a real
+-- vehicle/pod has getDriver; a baseplate or prop does not, so route those through
+-- the baseplate's Vehicles wirelink output instead of treating them AS the seat.
+-- getWirelink is server-only, so resolveBaseplateSeat/resolveSeatFrom must run
+-- server-side; the resolved seat can then be networked for client-side driver reads.
+local SeatBaseplateEnt
+local SeatBaseplateWirelink
+
+-- base: candidate ACF baseplate entity; self: the calling chip (never a seat).
+-- Caches the baseplate wirelink so repeated resolves don't re-fetch it.
+function resolveBaseplateSeat(base, self)
+    if not isValid(base) or base == self or base:getClass() ~= "acf_baseplate" then return nil end
+
+    if base ~= SeatBaseplateEnt then
+        SeatBaseplateEnt = base
+        local ok, wirelink = pcall(function() return base:getWirelink() end)
+        SeatBaseplateWirelink = ok and wirelink or nil
+    end
+
+    if not SeatBaseplateWirelink then return nil end
+
+    local vehicles = SeatBaseplateWirelink["Vehicles"]
+    if type(vehicles) ~= "table" then return nil end
+
+    local seat = vehicles[1]
+    if isValid(seat) and seat ~= self then return seat end
+    return nil
+end
+
+-- ent: a Chair/Seat/Base input; self: the calling chip. Returns a usable seat
+-- (one with getDriver) or nil. Server-side only (resolveBaseplateSeat uses getWirelink).
+function resolveSeatFrom(ent, self)
+    if not isValid(ent) or ent == self then return nil end
+    if ent.getDriver then return ent end
+    return resolveBaseplateSeat(ent, self)
+end
+
+-- seat: a resolved seat entity; self: the calling chip. Returns the seat's driver
+-- or nil, guarding the getDriver call so a non-vehicle seat never errors. Shared
+-- realm: getDriver is available client-side once the seat entity is networked.
+function seatActiveDriver(seat, self)
+    if not isValid(seat) or seat == self then return nil end
+    if not seat.getDriver then return nil end
+
+    local driver = seat:getDriver()
+    if isValid(driver) then return driver end
+    return nil
 end
 
 -- value: trace-filter-like input containing entities
