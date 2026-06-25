@@ -1,6 +1,6 @@
 --@name Jet Gunsight Screenlink Example
 --@author March / Ally
---@include lib/modular_wire_helper.txt
+--@include ../../lib/modular_wire_helper.txt
 
 --[[
 Purpose:
@@ -31,7 +31,7 @@ if SERVER then
         end
     end)    
     
-    require "lib/modular_wire_helper.txt"
+    require "../../lib/modular_wire_helper.txt"
     setIO(
         parseE2IO("Base:entity CamPos:vector FOV")
     ) 

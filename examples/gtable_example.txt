@@ -1,5 +1,5 @@
 --@name GTABLE Example
---@include lib/gtable_library.txt
+--@include ../allylib/gtable_library.txt
 --@server
 
 --[[
@@ -17,7 +17,7 @@ What To Learn:
 ]]--
 
 -- pull in the GTABLE library
-require("lib/gtable_library.txt")
+require("../allylib/gtable_library.txt")
 -- [FUTURE] In larger examples we would wrap library setup in a local factory/helper instead of open-coded globals.
 
 local PREFIX = "GTABLE_DEMO"
