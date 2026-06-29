@@ -59,6 +59,18 @@ local function entityMethodDefault(method)
     return 0
 end
 
+local function isUsableEntity(ent)
+    if ent == nil then return false end
+    local t = type(ent)
+    if t == "number" or t == "string" or t == "boolean" then return false end
+    local ok, valid = pcall(isValid, ent)
+    if ok then return valid == true end
+    local fn = ent.isValid
+    if type(fn) ~= "function" then return false end
+    ok, valid = pcall(fn, ent)
+    return ok and valid == true
+end
+
 local function installGlobalAccessors()
     if DirectInstalled then return end
     DirectInstalled = true
@@ -293,15 +305,13 @@ function sendEntityData(name, interval, ...)
         local pollInterval = interval > 0 and interval or 0.1
         timer.create(timerName, pollInterval, 0, function()
             local ent = InputValues[name]
-            local valid = false
-            if ent ~= nil and type(ent) ~= "number" and type(ent) ~= "string" and type(ent) ~= "boolean" then
-                local ok, r = pcall(function() return ent.isValid and ent:isValid() end)
-                valid = ok and r == true
-            end
+            local valid = isUsableEntity(ent)
             for i = 1, #methods do
                 local method = methods[i]
                 if valid then
-                    local ok, v = pcall(function() return ent[method](ent) end)
+                    local fn = ent[method]
+                    local ok, v = false, nil
+                    if type(fn) == "function" then ok, v = pcall(fn, ent) end
                     if ok and v ~= nil then
                         BaseUpdateNetworkedVariable(name .. method, v, interval)
                     end

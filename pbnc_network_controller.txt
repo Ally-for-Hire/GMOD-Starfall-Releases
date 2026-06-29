@@ -1,0 +1,855 @@
+--@name PBNC - Persistent Battlefield Net Controller
+--@author Ally for Hire / Merydian9
+--@include GMOD-Starfall-Releases/allylib/general_algorithms.txt
+--@include GMOD-Starfall-Releases/allylib/simple_wire_helper.txt
+--@include GMOD-Starfall-Releases/allylib/gtable_library.txt
+--@shared
+
+--[[
+PBNC - Persistent Battlefield Net Controller (SCRL successor)
+
+A single chip that gives a contraption a shared tactical command net. Players on the
+same net drop world markers (attack / defend / ping), broadcast team chat, and request
+ARTILLERY (claimable, one-shot) or ORDINANCE (timed 30s broadcast) fire missions that
+external chips fulfil through the wire.
+
+Spec: wiki/scripts/pbnc.md in the GMod LLM wiki.
+
+Realms:
+  SERVER  wire I/O, PlayerSay command parsing, GTABLE net state (server-only), id
+          allocation, artillery arbitration, wire outputs, per-operator replication.
+  CLIENT  reads replicated state, gates on player()==operator + on-HUD, renders holograms
+          + labels. Chat is delivered server-side via print() to the chip owner's chat.
+
+Backbone libs: allylib GTABLE (synced cross-chip table), simple_wire_helper (wire I/O +
+NetVars), general_algorithms (resolveSeatFrom / seatActiveDriver / safeRunRemote).
+]]--
+
+require("GMOD-Starfall-Releases/allylib/general_algorithms.txt")
+require("GMOD-Starfall-Releases/allylib/simple_wire_helper.txt")
+if SERVER then require("GMOD-Starfall-Releases/allylib/gtable_library.txt") end
+
+-- ============================ shared constants ============================
+local GT_PREFIX   = "PBNC"
+local CMD_PREFIX  = ".-"
+
+-- marker / render types (shared so client color maps line up with server tags)
+local MK_ATTACK, MK_DEFEND, MK_PING, MK_ARTY, MK_ORD, MK_MEMBER = 1, 2, 3, 4, 5, 6
+
+-- lifetimes / durations (gameplay spec values, not perf-tuned magic numbers)
+local MARKER_LIFETIME = 120   -- attack / defend marker seconds before auto-expire
+local PING_LIFETIME   = 45    -- ping marker seconds
+local ORD_DURATION    = 30    -- ordinance broadcast seconds (spec)
+local ARTY_LIFETIME   = 300   -- artillery safety expiry if never accepted
+local MEMBER_TIMEOUT  = 8     -- member beacon goes stale after this many seconds
+local MEMBER_REFRESH  = 3     -- max seconds between member beacon rewrites
+local MEMBER_MOVE_DIST = 16   -- rewrite member beacon after moving this many GU
+local PRUNE_INTERVAL  = 1     -- stale marker/member reap cadence
+local ARB_WINDOW      = 0.05  -- artillery claim arbitration window
+local SERVICE_WINDOW  = 15    -- how long a won artillery mission stays on the winner's wire
+local TICK            = 0.2   -- server resolve/rebuild tick
+
+-- StarfallEx has NO general chat library; print() delivers to the chip OWNER's chat
+-- (instance.player), burst-limited. So PBNC chat appears in the owner's chat.
+local PBNC_CHAT_COLOR = Color(96, 255, 96)
+
+-- ============================ wire interface =============================
+-- declared shared; the helper handles realm internals
+updateInputs("Chair:entity HitPos:vector ResponseID:number")
+updateOutputs("MissionID:array MissionInfo:array MissionRounds:array MissionNames:array")
+unnetworkInputs(true) -- client never needs the raw inputs; it uses the netvars below
+
+-- server -> client replication
+addNetworkedVariable("StoredSeat", TICK, chip())  -- resolved seat (driver gating)
+addNetworkedVariable("ChairWired", 0.5, 0)        -- 1 when Chair is wired
+addNetworkedVariable("NetName", 0.5, "")          -- operator's current net name
+addNetworkedVariable("Renders", TICK, {})         -- markers + missions + members to draw
+
+-- key helpers (shared)
+local function isMarkerKey(k)  return type(k) == "string" and string.sub(k, 1, 7) == "marker:" end
+local function isMissionKey(k) return type(k) == "string" and string.sub(k, 1, 8) == "mission:" end
+local function isMemberKey(k)  return type(k) == "string" and string.sub(k, 1, 7) == "member:" end
+
+-- ================================ SERVER =================================
+if SERVER then
+
+local gt
+local operator     -- current operator player (driver if wired, owner if not)
+local curNet  = "" -- current net name
+local curPass = "" -- current net password
+local manualNet = false -- true once the operator manually .-join'd a net
+local wiredNow  = false
+local seatNow   = nil
+local dirty     = true
+local memberKey = "member:" .. chip():entIndex()
+local lastMember = 0
+local lastMemberPos = nil
+local lastPrune = -PRUNE_INTERVAL
+local lastGuardError = 0
+
+local pendingClaims = {} -- [missionId] = { list = { {chip=, name=, time=} }, scheduled = bool }
+local awarded       = {} -- [missionId] = { pos=, rounds=, name=, net=, expire= }  (winner-local)
+
+-- ----- small utils -----
+local function trim(s) return string.match(tostring(s or ""), "^%s*(.-)%s*$") end
+
+local function splitFirst(s) -- "5 some name" -> "5", "some name"
+    s = trim(s)
+    local a, b = string.match(s, "^(%S+)%s*(.*)$")
+    return a or "", b or ""
+end
+
+local function locStr(p)
+    return string.format("(%i, %i, %i)",
+        math.floor(p:getX() + 0.5), math.floor(p:getY() + 0.5), math.floor(p:getZ() + 0.5))
+end
+
+local function opName()
+    if isValid(operator) then return operator:getName() end
+    return "Unknown"
+end
+
+local function randomPass()
+    local cs = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    local out = ""
+    for _ = 1, 6 do
+        local i = math.floor(math.random() * #cs) + 1
+        out = out .. string.sub(cs, i, i)
+    end
+    return out
+end
+
+local function teamPass(t) return "PBNC-T" .. tostring(t) end
+local function teamNetName(t) return "TEAM " .. tostring(t) end
+
+-- ----- chat delivery -----
+-- send one already-formatted line to THIS chip's operator only
+local function tellOperator(text)
+    if not isValid(operator) then return end
+    -- print() goes to the chip owner's chat; pcall guards the burst limit / any throw so a
+    -- chat line can never terminate the chip
+    pcall(print, PBNC_CHAT_COLOR, text)
+end
+
+local function guardError(context, err)
+    local now = timer.curtime()
+    if now - lastGuardError < 5 then return end
+    lastGuardError = now
+    pcall(print, PBNC_CHAT_COLOR, "[PBNC]: " .. context .. " error: " .. tostring(err))
+end
+
+-- fan a line out to every operator on a net (origin included, so it sees its own line)
+local function broadcast(netName, text)
+    safeRunRemote(nil, "PBNC_CHAT", netName, text)
+end
+
+-- ----- aim resolution -----
+local function aimPos()
+    if wiredNow then
+        local hp = InputValues.HitPos
+        if hp and hp ~= Vector() then return hp end
+    end
+    if isValid(operator) then
+        local ok, tr = pcall(function() return operator:getEyeTrace() end)
+        if ok and tr and tr.HitPos then return tr.HitPos end
+    end
+    return nil
+end
+
+local function operatorPos()
+    if wiredNow and isValid(seatNow) then return seatNow:getPos() end
+    if isValid(operator) then return operator:getPos() end
+    return Vector()
+end
+
+-- ----- id allocation (net-global sequential; collision-free thanks to synchronous
+-- remote propagation + isReady gating, see wiki) -----
+local function allocId()
+    -- seed from the highest known id so two chips that have already synced never reuse a low
+    -- counter; combined with isReady gating this keeps ids collision-free under normal play.
+    local mx = gt:get("__seq", 0)
+    for k, v in pairs(gt:rawTable()) do
+        if (isMarkerKey(k) or isMissionKey(k)) and type(v) == "table" and (v.id or 0) > mx then
+            mx = v.id
+        end
+    end
+    local id = mx + 1
+    gt:set("__seq", id)
+    return id
+end
+
+-- ----- net join / membership -----
+local function writeMember(force)
+    if not isValid(operator) or curNet == "" then return end
+    local now = timer.curtime()
+    local pos = operatorPos()
+    local moved = not lastMemberPos or (pos - lastMemberPos):getLength() > MEMBER_MOVE_DIST
+    if not force and not moved and now - lastMember < MEMBER_REFRESH then return end
+    lastMember = now
+    lastMemberPos = pos
+    gt:set(memberKey, {
+        net = curNet, name = opName(), pos = pos,
+        team = operator:getTeam(), time = now, oc = chip(),
+    })
+end
+
+local function clearMember()
+    if gt and gt:has(memberKey) then gt:remove(memberKey) end
+    lastMember = 0
+    lastMemberPos = nil
+end
+
+-- join or create a net. manual=true marks a deliberate .-join (suppresses team auto-join).
+local function doJoin(netName, pass, manual)
+    netName = trim(netName)
+    if netName == "" then
+        tellOperator("[PBNC]: Usage: .-join [name] [password]")
+        return false
+    end
+
+    local rec = gt:get("net:" .. netName)
+    if type(rec) ~= "table" then rec = nil end
+    if rec == nil then
+        local realPass = (pass ~= "" and pass) or randomPass()
+        gt:set("net:" .. netName, { password = realPass, createdBy = opName(), time = timer.curtime(), oc = chip() })
+        pass = realPass
+    else
+        if pass == "" or pass ~= rec.password then
+            tellOperator("[PBNC]: Incorrect password for network " .. netName .. ".")
+            return false
+        end
+    end
+
+    -- leave previous membership
+    clearMember()
+
+    curNet  = netName
+    curPass = pass
+    manualNet = manual and true or manualNet
+    NetName = curNet
+    writeMember(true)
+    dirty = true
+
+    tellOperator("[PBNC]: You have joined " .. netName .. ".")
+    tellOperator("[PBNC]: To send a message to the net, start it with .-m   (example: .-m Enemies near sewage, need help)")
+    tellOperator("[PBNC]: To mark a spot for your team, use .-a / .-d / .-p at what you are aiming at.")
+    tellOperator("[PBNC]: Type .-help for more information.")
+    return true
+end
+
+local function joinTeamNet()
+    if not isValid(operator) then return end
+    local t = operator:getTeam()
+    doJoin(teamNetName(t), teamPass(t), false)
+end
+
+-- ----- markers / missions -----
+local function createMarker(mtype, pos, name)
+    local id = allocId()
+    local now = timer.curtime()
+    local life = (mtype == MK_PING) and PING_LIFETIME or MARKER_LIFETIME
+    gt:set("marker:" .. id, {
+        id = id, net = curNet, oc = chip(), type = mtype,
+        pos = pos, name = name, time = now, expireAt = now + life,
+    })
+    dirty = true
+    return id
+end
+
+local function createMission(kind, pos, rounds, name)
+    local id = allocId()
+    local now = timer.curtime()
+    local expireAt = (kind == "ordinance") and (now + ORD_DURATION) or (now + ARTY_LIFETIME)
+    gt:set("mission:" .. id, {
+        id = id, net = curNet, oc = chip(), kind = kind, pos = pos, rounds = rounds,
+        name = name, status = "open", claimedBy = "", time = now, expireAt = expireAt,
+    })
+    dirty = true
+    return id
+end
+
+-- ----- artillery arbitration -----
+local function finalizeClaim(missionId)
+    local pc = pendingClaims[missionId]
+    pendingClaims[missionId] = nil
+    if not pc then return end
+
+    local rec = gt:get("mission:" .. missionId)
+    if not rec or rec.oc ~= chip() or rec.kind ~= "artillery" or rec.status ~= "open" then return end
+
+    -- winner: earliest claim; random among those that arrived in the same tick as the earliest
+    local minT = nil
+    for _, c in ipairs(pc.list) do
+        if minT == nil or c.time < minT then minT = c.time end
+    end
+    local cands = {}
+    for _, c in ipairs(pc.list) do
+        if c.time - minT <= 1e-3 then cands[#cands + 1] = c end
+    end
+    if #cands == 0 then return end
+    local winner = cands[math.floor(math.random() * #cands) + 1]
+    if not isValid(winner.chip) then return end
+
+    gt:remove("mission:" .. missionId) -- artillery is removed once accepted
+    dirty = true
+    broadcast(rec.net, "[PBNC] " .. winner.name .. ": Fulfilling mission ID " .. missionId .. ".")
+    safeRunRemote(winner.chip, "PBNC_AWARD", missionId, rec.pos, rec.rounds, rec.name, rec.net)
+end
+
+local function handleClaim(claimantChip, missionId, claimantName)
+    local rec = gt:get("mission:" .. missionId)
+    if not rec or rec.oc ~= chip() or rec.kind ~= "artillery" or rec.status ~= "open" then return end
+    if not isValid(claimantChip) then return end
+
+    local pc = pendingClaims[missionId]
+    if not pc then
+        pc = { list = {}, scheduled = false }
+        pendingClaims[missionId] = pc
+    end
+    pc.list[#pc.list + 1] = { chip = claimantChip, name = tostring(claimantName or "Unknown"), time = timer.curtime() }
+    if not pc.scheduled then
+        pc.scheduled = true
+        timer.simple(ARB_WINDOW, function() finalizeClaim(missionId) end)
+    end
+end
+
+local function handleAward(id, pos, rounds, name, netName)
+    awarded[id] = { pos = pos, rounds = rounds or 1, name = name or "", net = netName or curNet, expire = timer.curtime() + SERVICE_WINDOW }
+    dirty = true
+end
+
+-- responder claims an open artillery mission by id (wire ResponseID rising-edge or .-accept)
+local function attemptClaim(id)
+    id = tonumber(id)
+    if not id or id <= 0 then return false end
+    if not gt or not gt:isReady() or curNet == "" then return false end
+    local rec = gt:get("mission:" .. id)
+    if not rec or rec.kind ~= "artillery" or rec.status ~= "open" or rec.net ~= curNet then return false end
+    if not isValid(rec.oc) then return false end
+    safeRunRemote(rec.oc, "PBNC_CLAIM", id, opName())
+    return true
+end
+
+-- ----- help text -----
+local HELP = {
+    "[PBNC]: .-help  -- shows this menu",
+    "[PBNC]: .-attack/atk/a [message]  -- mark a spot to attack + chat",
+    "[PBNC]: .-defend/def/d [message]  -- mark a spot to defend + chat",
+    "[PBNC]: .-ping/p [name]  -- mark a spot with an optional name",
+    "[PBNC]: .-message/msg/m [text]  -- send a message to the net",
+    "[PBNC]: .-mission_list/ml  -- list active missions + artillery requests",
+    "[PBNC]: .-artillery/arty [rounds] [name]  -- request artillery (claimable)",
+    "[PBNC]: .-mission/ord/o [name]  -- request ordinance (timed 30s broadcast)",
+    "[PBNC]: .-accept/acc/ac [id]  -- fulfil an artillery mission by id",
+    "[PBNC]: .-update_mission/u [id] [message]  -- move/retitle your mission",
+    "[PBNC]: .-cancel/c [id]  -- cancel your mission",
+    "[PBNC]: .-net_info/net  -- show network name + password",
+}
+
+-- ----- command table -----
+local ALIAS = {
+    join = "join", help = "help",
+    attack = "attack", atk = "attack", a = "attack",
+    defend = "defend", def = "defend", d = "defend",
+    ping = "ping", p = "ping",
+    message = "message", msg = "message", m = "message",
+    mission_list = "mlist", m_list = "mlist", mlist = "mlist", ml = "mlist",
+    artillery = "arty", arty = "arty",
+    mission = "ord", miss = "ord", ordinance = "ord", ord = "ord", o = "ord",
+    update_mission = "update", update = "update", u = "update",
+    cancel = "cancel", c = "cancel",
+    accept = "accept", acc = "accept", ac = "accept",
+    net_info = "net", net = "net",
+}
+
+local function cmdMark(mtype, rest)
+    if curNet == "" then tellOperator("[PBNC]: Join a net first with .-join.") return end
+    local pos = aimPos()
+    if not pos then tellOperator("[PBNC]: No aim point available.") return end
+    local name = (mtype == MK_ATTACK and "Attack") or (mtype == MK_DEFEND and "Defend")
+        or (rest ~= "" and rest) or "Ping"
+    createMarker(mtype, pos, name)
+    local pn = opName()
+    broadcast(curNet, "[PBNC]: " .. pn .. " has marked " .. locStr(pos))
+    if mtype == MK_ATTACK then
+        broadcast(curNet, "[PBNC] " .. pn .. ": Marked a location for attack.")
+    elseif mtype == MK_DEFEND then
+        broadcast(curNet, "[PBNC] " .. pn .. ": Marked a location for defence.")
+    else -- ping
+        if rest ~= "" then broadcast(curNet, "[PBNC] " .. pn .. ": Pinged a location \"" .. rest .. "\".")
+        else broadcast(curNet, "[PBNC] " .. pn .. ": Sent a ping.") end
+    end
+    if (mtype == MK_ATTACK or mtype == MK_DEFEND) and rest ~= "" then
+        broadcast(curNet, "[PBNC] " .. pn .. ": " .. rest)
+    end
+end
+
+local function cmdList()
+    if curNet == "" then return end
+    tellOperator("[PBNC]: Active missions on \"" .. curNet .. "\":")
+    local any = false
+    local now = timer.curtime()
+    for key, v in pairs(gt:rawTable()) do
+        if isMissionKey(key) and type(v) == "table" and v.net == curNet
+            and (v.expireAt or 0) > now and v.status == "open" then
+            any = true
+            local detail = (v.kind == "artillery") and (v.rounds .. " round(s)") or "ordinance"
+            tellOperator(string.format("[PBNC]: ID %s [%s] \"%s\" %s %s",
+                tostring(v.id), v.kind, tostring(v.name), detail, locStr(v.pos)))
+        end
+    end
+    if not any then tellOperator("[PBNC]: (none)") end
+end
+
+local function cmdArty(rest)
+    if curNet == "" then tellOperator("[PBNC]: Join a net first with .-join.") return end
+    local pos = aimPos()
+    if not pos then tellOperator("[PBNC]: No aim point available.") return end
+    local first, restName = splitFirst(rest)
+    local rounds = tonumber(first)
+    local name
+    if rounds and rounds > 0 then
+        rounds = math.floor(rounds)
+        name = (restName ~= "" and restName) or "Artillery"
+    else
+        rounds = 1
+        name = (rest ~= "" and rest) or "Artillery"
+    end
+    local id = createMission("artillery", pos, rounds, name)
+    broadcast(curNet, "[PBNC] " .. opName() .. ": Requested " .. rounds ..
+        " round(s) on marker \"" .. name .. "\". ID: " .. id)
+end
+
+local function cmdOrd(rest)
+    if curNet == "" then tellOperator("[PBNC]: Join a net first with .-join.") return end
+    local pos = aimPos()
+    if not pos then tellOperator("[PBNC]: No aim point available.") return end
+    local name = (rest ~= "" and rest) or "Ordinance"
+    local id = createMission("ordinance", pos, 0, name)
+    broadcast(curNet, "[PBNC] " .. opName() .. ": Requested ordinance \"" .. name .. "\". ID: " .. id)
+end
+
+local function ownedMission(idStr)
+    local id = tonumber(idStr)
+    if not id then return nil, nil end
+    local key = "mission:" .. id
+    local v = gt:get(key)
+    if not v or v.net ~= curNet then
+        tellOperator("[PBNC]: No mission ID " .. tostring(idStr) .. " on your net.")
+        return nil, nil
+    end
+    if v.oc ~= chip() then
+        tellOperator("[PBNC]: You can only change your own missions.")
+        return nil, nil
+    end
+    return key, v
+end
+
+local function cmdUpdate(rest)
+    local idStr, msg = splitFirst(rest)
+    local key, v = ownedMission(idStr)
+    if not key then return end
+    local newPos = aimPos() or v.pos
+    local newName = (msg ~= "" and msg) or v.name
+    gt:set(key, {
+        id = v.id, net = v.net, oc = chip(), kind = v.kind, pos = newPos, rounds = v.rounds,
+        name = newName, status = v.status, claimedBy = v.claimedBy,
+        time = timer.curtime(), expireAt = v.expireAt,
+    })
+    dirty = true
+    broadcast(curNet, "[PBNC] " .. opName() .. ": Updated mission ID " .. v.id ..
+        (msg ~= "" and (" - " .. msg) or "") .. ".")
+end
+
+local function cmdCancel(rest)
+    local idStr = trim(rest)
+    local key, v = ownedMission(idStr)
+    if not key then return end
+    gt:remove(key)
+    dirty = true
+    broadcast(curNet, "[PBNC] " .. opName() .. ": Cancelled mission ID " .. v.id .. ".")
+end
+
+local function processCommand(text)
+    local firstTok = string.match(text, "^(%S+)")
+    if not firstTok then return false end
+    local keyword = string.lower(string.sub(firstTok, 3)) -- strip ".-"
+    local canon = ALIAS[keyword]
+    local rest = trim(string.sub(text, #firstTok + 1))
+
+    if not canon then
+        for _, line in ipairs(HELP) do tellOperator(line) end
+        return true
+    end
+
+    if canon == "help" then
+        for _, line in ipairs(HELP) do tellOperator(line) end
+    elseif canon == "join" then
+        local name, pass = splitFirst(rest)
+        doJoin(name, pass, true)
+    elseif canon == "net" then
+        if curNet == "" then tellOperator("[PBNC]: You are not on a net.")
+        else tellOperator("[PBNC]: Network \"" .. curNet .. "\" password: " .. curPass) end
+    elseif canon == "attack" then cmdMark(MK_ATTACK, rest)
+    elseif canon == "defend" then cmdMark(MK_DEFEND, rest)
+    elseif canon == "ping"   then cmdMark(MK_PING, rest)
+    elseif canon == "message" then
+        if curNet == "" then tellOperator("[PBNC]: Join a net first with .-join.")
+        elseif rest ~= "" then broadcast(curNet, "[PBNC] " .. opName() .. ": " .. rest) end
+    elseif canon == "mlist"  then cmdList()
+    elseif canon == "arty"   then cmdArty(rest)
+    elseif canon == "ord"    then cmdOrd(rest)
+    elseif canon == "accept" then
+        if attemptClaim(rest) then
+            tellOperator("[PBNC]: Attempting to fulfil mission ID " .. trim(rest) .. ".")
+        else
+            tellOperator("[PBNC]: No open artillery mission ID " .. trim(rest) .. " on your net.")
+        end
+    elseif canon == "update" then cmdUpdate(rest)
+    elseif canon == "cancel" then cmdCancel(rest)
+    end
+    return true
+end
+
+-- ----- operator lifecycle -----
+local function sendWelcome()
+    tellOperator("[PBNC]: Welcome to PBNC!")
+    tellOperator("[PBNC]: You will be placed on your team net. Type .-join [name] [password] for a private net.")
+    tellOperator("[PBNC]: Type .-help for more information.")
+end
+
+local function setOperator(newOp)
+    if newOp == operator then return end
+    if isValid(operator) then clearMember() end
+    operator = newOp
+    -- every operator change starts from a clean net so a new driver never inherits the previous
+    -- operator's net / password / manual-join latch (a single operator's later .-join still
+    -- persists because this only runs on a real operator change)
+    curNet, curPass, manualNet = "", "", false
+    NetName = ""
+    if isValid(operator) then
+        sendWelcome()
+        joinTeamNet()
+    end
+    dirty = true
+end
+
+-- ----- expiry / rebuild -----
+-- Reap stale entries regardless of owner so a dead/crashed chip's rows self-heal (spec: entries
+-- self-heal if a chip dies without cleanup). Live members refresh on movement or every
+-- MEMBER_REFRESH (well under MEMBER_TIMEOUT), so only truly-dead beacons are reaped; GTABLE is
+-- LWW so the first live chip to notice removes it for everyone.
+local function pruneStale(now)
+    now = now or timer.curtime()
+    local rem = nil
+    for key, v in pairs(gt:rawTable()) do
+        if type(v) == "table" then
+            local stale = false
+            if isMarkerKey(key) or isMissionKey(key) then
+                stale = (v.expireAt or 0) <= now
+            elseif isMemberKey(key) then
+                stale = (now - (v.time or 0)) >= MEMBER_TIMEOUT
+            end
+            if stale then
+                rem = rem or {}
+                rem[#rem + 1] = key
+            end
+        end
+    end
+    if rem then
+        for _, k in ipairs(rem) do gt:remove(k) end
+        dirty = true
+    end
+    for id, a in pairs(awarded) do
+        if a.expire <= now then awarded[id] = nil dirty = true end
+    end
+end
+
+local function rebuild()
+    local missions = {}
+    local renders = {}
+    local now = timer.curtime()
+
+    if curNet ~= "" then
+        for key, v in pairs(gt:rawTable()) do
+            if type(v) == "table" and v.net == curNet then
+                if isMarkerKey(key) and (v.expireAt or 0) > now then
+                    renders[#renders + 1] = { i = v.id, t = v.type, p = v.pos, n = v.name }
+                elseif isMissionKey(key) and (v.expireAt or 0) > now and v.status == "open" then
+                    missions[#missions + 1] = { id = v.id, pos = v.pos, rounds = v.rounds, name = v.name }
+                    renders[#renders + 1] = { i = v.id, p = v.pos, n = v.name,
+                        t = (v.kind == "artillery") and MK_ARTY or MK_ORD }
+                elseif isMemberKey(key) and (now - (v.time or 0)) < MEMBER_TIMEOUT then
+                    renders[#renders + 1] = { i = key, t = MK_MEMBER, p = v.pos, n = v.name, tm = v.team }
+                end
+            end
+        end
+    end
+
+    -- winner-local awarded artillery stays on the wire for the full SERVICE_WINDOW (it is local
+    -- and self-expires via pruneStale), so it is not gated on the live net
+    for id, a in pairs(awarded) do
+        if a.expire > now then
+            missions[#missions + 1] = { id = id, pos = a.pos, rounds = a.rounds, name = a.name }
+        end
+    end
+
+    -- stable ordering: external chips index MissionID[i] consistently across ticks, and the
+    -- netvar/wire same()-guards suppress redundant resends from nondeterministic pairs() order
+    table.sort(missions, function(x, y) return x.id < y.id end)
+    table.sort(renders, function(x, y) return tostring(x.i) < tostring(y.i) end)
+
+    local mid, minfo, mr, mn = {}, {}, {}, {}
+    for i = 1, #missions do
+        local m = missions[i]
+        mid[i] = m.id
+        minfo[i] = m.pos
+        mr[i] = m.rounds
+        mn[i] = m.name
+    end
+
+    MissionID = mid
+    MissionInfo = minfo
+    MissionRounds = mr
+    MissionNames = mn
+    Renders = renders
+end
+
+-- ----- hooks -----
+gt = GTABLE:new(GT_PREFIX)
+gt:onChange(function() dirty = true end)
+
+local function sayHook(ply, text)
+    if ply ~= operator then return end
+    if string.sub(text, 1, 2) ~= CMD_PREFIX then return end
+    if not gt or not gt:isReady() then return "" end
+    local ok, err = pcall(processCommand, text)
+    if not ok then guardError("command", err) end
+    return "" -- always suppress the operator's command line
+end
+
+hook.add("PlayerSay", "PBNC_say", sayHook)
+
+local function remoteBody(sender, owner_, msg, a, b, c, d, e)
+    if msg == "PBNC_CHAT" then
+        if curNet ~= "" and a == curNet and isValid(operator) then tellOperator(b) end
+    elseif msg == "PBNC_CLAIM" then
+        handleClaim(sender, a, b)
+    elseif msg == "PBNC_AWARD" then
+        handleAward(a, b, c, d, e)
+    end
+end
+
+local function remoteHook(sender, owner_, msg, a, b, c, d, e)
+    local ok, err = pcall(remoteBody, sender, owner_, msg, a, b, c, d, e)
+    if not ok then guardError("remote", err) end
+end
+
+hook.add("remote", "PBNC_remote", remoteHook)
+
+inputClk("ResponseID", function(v)
+    attemptClaim(v)
+end)
+
+local function tickBody()
+    if not gt then return end
+
+    local chair = InputValues.Chair
+    wiredNow = isValid(chair) and chair ~= chip()
+    seatNow = wiredNow and resolveSeatFrom(chair, chip()) or nil
+
+    StoredSeat = (isValid(seatNow) and seatNow) or chip()
+    ChairWired = wiredNow and 1 or 0
+
+    local op
+    if wiredNow then
+        op = isValid(seatNow) and seatActiveDriver(seatNow, chip()) or nil
+    else
+        op = owner()
+    end
+    setOperator(op)
+
+    if gt:isReady() then
+        if isValid(operator) and curNet ~= "" then writeMember(false) end
+        local now = timer.curtime()
+        if now - lastPrune >= PRUNE_INTERVAL then
+            lastPrune = now
+            pruneStale(now)
+        end
+    end
+    -- rebuild only when something changed (commands, sync, prune, awards, operator/net change);
+    -- dirty coalesces a burst of changes into at most one rebuild per tick, and idle nets cost nothing
+    if dirty then rebuild() dirty = false end
+end
+
+local function tickHook()
+    local ok, err = pcall(tickBody)
+    if not ok then guardError("tick", err) end
+end
+
+timer.create("PBNC_tick", TICK, 0, tickHook)
+
+end -- SERVER
+
+-- ================================ CLIENT =================================
+if CLIENT then
+
+local TYPE_COLOR = {
+    [MK_ATTACK] = Color(255, 60, 60),
+    [MK_DEFEND] = Color(60, 120, 255),
+    [MK_PING]   = Color(255, 230, 60),
+    [MK_ARTY]   = Color(255, 140, 0),
+    [MK_ORD]    = Color(190, 80, 255),
+    [MK_MEMBER] = Color(60, 255, 120),
+}
+local WHITE = Color(255, 255, 255)
+local MEMBER_ENEMY = Color(180, 180, 180)
+
+local holos = {}  -- [idKey] = { parts = {}, t =, px =, color = }
+local hudOn = false
+local clientActive = false
+local lastClientGuardError = 0
+
+local function clientGuardError(context, err)
+    local now = timer.curtime()
+    if now - lastClientGuardError < 5 then return end
+    lastClientGuardError = now
+    pcall(print, PBNC_CHAT_COLOR, "[PBNC]: " .. context .. " error: " .. tostring(err))
+end
+
+local function clientOperator()
+    if (ChairWired or 0) == 1 then
+        return seatActiveDriver(StoredSeat, chip())
+    end
+    return owner()
+end
+
+local function updateClientActive()
+    local op = clientOperator()
+    clientActive = isValid(op) and op == player()
+end
+
+local function colorFor(r, teamId)
+    if r.t == MK_MEMBER then
+        return (r.tm == teamId) and TYPE_COLOR[MK_MEMBER] or MEMBER_ENEMY
+    end
+    return TYPE_COLOR[r.t] or WHITE
+end
+
+local function makeArrow(pos, color)
+    local parts = {}
+    for n = 1, 3 do
+        if holograms.canSpawn() then
+            local h = holograms.create(pos + Vector(0, 0, 120 + (n - 1) * 90), Angle(180, 0, 0),
+                "models/holograms/hq_cone.mdl", Vector(6))
+            if h then h:setColor(color) h:setMaterial("models/debugwhite") parts[#parts + 1] = h end
+        end
+    end
+    if holograms.canSpawn() then
+        local r = holograms.create(pos + Vector(0, 0, 2), Angle(0, 0, 0),
+            "models/sprops/geometry/t_fdisc_24.mdl", Vector(25, 25, 0.1))
+        if r then r:setColor(color) r:setMaterial("models/wireframe") parts[#parts + 1] = r end
+    end
+    return parts
+end
+
+local function makeMember(pos, color)
+    local parts = {}
+    if holograms.canSpawn() then
+        local h = holograms.create(pos + Vector(0, 0, 90), Angle(0, 0, 0),
+            "models/holograms/hq_sphere.mdl", Vector(4))
+        if h then h:setColor(color) h:setMaterial("models/debugwhite") parts[#parts + 1] = h end
+    end
+    return parts
+end
+
+local function removeEntry(e)
+    for _, h in ipairs(e.parts) do if isValid(h) then h:remove() end end
+end
+
+local function clearAll()
+    for k, e in pairs(holos) do removeEntry(e) end
+    holos = {}
+end
+
+local function reconcile()
+    -- holograms render whenever this client is the joined operator, independent of HUD state
+    -- (spec: name labels need a HUD, but the holograms show regardless)
+    if not clientActive or (NetName or "") == "" then
+        clearAll()
+        return
+    end
+
+    local renders = Renders or {}
+    local seen = {}
+    local teamId = player():getTeam()
+    for _, r in ipairs(renders) do
+        local key = tostring(r.i)
+        seen[key] = true
+        local e = holos[key]
+        if not e then
+            local color = colorFor(r, teamId)
+            local parts = (r.t == MK_MEMBER) and makeMember(r.p, color) or makeArrow(r.p, color)
+            holos[key] = { parts = parts, t = r.t, px = r.p, color = color }
+        elseif r.t == MK_MEMBER then
+            -- rebuild if the beacon lost the hologram-budget race at first sight
+            if isValid(e.parts[1]) then e.parts[1]:setPos(r.p + Vector(0, 0, 90))
+            else removeEntry(e) e.parts = makeMember(r.p, e.color) end
+            e.px = r.p
+        elseif #e.parts < 4 or (r.p - e.px):getLength() > 1 then
+            -- a full arrow is 3 cones + 1 ring = 4 parts; rebuild if incomplete or moved
+            removeEntry(e)
+            e.parts = makeArrow(r.p, e.color)
+            e.px = r.p
+        end
+    end
+    for key, e in pairs(holos) do
+        if not seen[key] then removeEntry(e) holos[key] = nil end
+    end
+end
+
+local function updateHud()
+    -- HUD enable: auto only when the chair is NOT wired (wired relies on the component HUD)
+    local wantHud = clientActive and (ChairWired or 0) ~= 1
+    if wantHud and not hudOn then enableHud(player(), true) hudOn = true
+    elseif not wantHud and hudOn then enableHud(player(), false) hudOn = false end
+end
+
+local function clientTimerBody()
+    updateClientActive()
+    updateHud()
+    reconcile()
+end
+
+local function clientTimer()
+    local ok, err = pcall(clientTimerBody)
+    if not ok then clientGuardError("client timer", err) end
+end
+
+timer.create("PBNC_client", 0.1, 0, clientTimer)
+
+local function drawHudBody()
+    if not clientActive or (NetName or "") == "" then return end
+    local renders = Renders or {}
+    local teamId = player():getTeam()
+    render.setFont("DermaLarge")
+    for _, r in ipairs(renders) do
+        if r.n and r.n ~= "" then
+            local up = (r.t == MK_MEMBER) and 140 or 420
+            local scr = (r.p + Vector(0, 0, up)):toScreen()
+            if scr.visible then
+                render.setColor(colorFor(r, teamId))
+                render.drawSimpleText(scr.x, scr.y, r.n, 1, 4) -- TEXT_ALIGN_CENTER / BOTTOM
+            end
+        end
+    end
+end
+
+local function drawHud()
+    local ok, err = pcall(drawHudBody)
+    if not ok then clientGuardError("drawhud", err) end
+end
+
+hook.add("drawhud", "PBNC_labels", drawHud)
+
+end -- CLIENT

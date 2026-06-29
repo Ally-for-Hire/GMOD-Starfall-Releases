@@ -4,8 +4,70 @@
 --@include allylib/general_algorithms.txt
 --@server
 
---- Version 0.18.1
+--- Version 0.22.0
 -- Sourced from https://github.com/Ally-for-Hire/gmod-starfall-projects/blob/main/ally_mobility_hours.txt
+-- Counter-steer windowing (0.22.0): straight-line yaw correction now only brakes for
+-- COUNTERSTEER_WINDOW seconds (default 1.0s) AFTER the driver releases A/D, instead of
+-- continuously while driving straight. The window is armed while steering and counts
+-- down once A/D is released; calibration keeps running outside it so the next release is
+-- ready. Plain straight cruising with no recent steer no longer counter-steers, which
+-- removes the remaining high-speed wobble. Trade-off: a bump off-course during steady
+-- cruise is no longer auto-corrected (steer briefly to re-arm). See applyCounterSteer.
+-- Counter-steer anti-oscillation (0.21.1): fixed a high-speed limit cycle (subtle
+-- left/right wobble that grows and bleeds forward speed). Two pumps removed from
+-- applyCounterSteer: (a) BRAKE-TO-ARREST -- a track brake only decelerates the hull's
+-- spin, so once the yaw is already decelerating fast enough to coast back to straight
+-- within COUNTERSTEER_LOOKAHEAD, the brake RELEASES instead of powering the hull through
+-- to the other side; (b) the brake SIDE is now chosen from the current smoothed yaw rate
+-- instead of the predicted value, so the lookahead can no longer flip sign near a
+-- zero-crossing and brake the wrong track. Both stopped energy being added each cycle, so
+-- the wobble decays instead of growing, and the constant alternating brake (the speed
+-- loss) is gone. Tuning: raise COUNTERSTEER_LOOKAHEAD for a calmer/earlier release, lower
+-- it to hold the correction closer to straight.
+-- Counter-steer self-calibration + jerk rejection (0.21.0): the straight-line yaw
+-- corrector now (a) LOW-PASSES the yaw rate before doing anything, so a brief jerk
+-- from a bump/graze/terrain-clip is attenuated instead of slamming a track, and
+-- (b) MEASURES each rig's natural yaw-noise floor and active yaw range live and
+-- DERIVES the deadzone + full-authority yaw from them, so the same chip works on a
+-- light buggy and a heavy tank with no per-vehicle yaw magnitudes to tune. The fixed
+-- YAW_DEADZONE (20) and MAX_YAW_RATE (240) magic numbers are gone; the predictive
+-- lead is computed from the SMOOTHED rate and clamped to one deadzone so a transient
+-- can't push a quiet hull over threshold. A ~1.5s warmup calibrates before the first
+-- correction. New knobs are dimensionless ratios / filter time constants only
+-- (COUNTERSTEER_YAW_TAU, _DEADZONE_MARGIN, _SPAN_RATIO); removed COUNTERSTEER_KI and
+-- COUNTERSTEER_ACCEL_SMOOTH. See applyCounterSteer.
+-- Counter-steer reverted to yaw-rate damping + smooth brake ramp (0.20.0): the 0.19.x
+-- HEADING HOLD experiment (hold the captured course, return to it after a spin) was
+-- reverted -- it returned too hard to the wrong place. Back to the v0.18.x reactive
+-- predictive corrector: damp the (lookahead-predicted) yaw RATE inside a deadzone, no
+-- course memory. The ONE change kept from the experiment's intent: the old hard
+-- minimum-brake FLOOR (max(MIN_BRAKE, prop)) that slammed 50% the instant yaw crossed
+-- the deadzone -- the original "minimum too low -> left/right chatter" cause -- is
+-- replaced by a SMOOTH proportional ramp (brake = pidNorm * brakePower) that rises from
+-- 0 at the deadzone and passes what used to be the minimum without a step. Removed
+-- COUNTERSTEER_MIN_BRAKE and all heading-hold knobs/state (HEADING_*, YAW_SMOOTH,
+-- FLOOR_TIME, SIDE_HOLD, STICTION_YAW, RETURN_YAW, Course/Active/Side/PrevHeading...);
+-- restored YAW_DEADZONE, MAX_YAW_RATE, COUNTERSTEER_KI/KD and the v0.18.x state.
+-- Steering invert consolidation (0.18.3): the three manual INVERT_* knobs
+-- (INVERT_BRAKE_STEER / INVERT_COUNTERSTEER / INVERT_REVERSE_STEER) become TWO
+-- independent knobs. INVERT_STEERING flips the DRIVER A/D response (neutral steer +
+-- brake steer); INVERT_COUNTERSTEERING flips ONLY the yaw auto-correction side.
+-- They are deliberately separate because the common failure is "A/D is backwards
+-- while the yaw correction is already correct" -- one must not drag the other.
+-- Neutral steer now honors INVERT_STEERING (inverts steerDir at the source, flipping
+-- pivot and braked side together); previously it had no manual override at all.
+-- INVERT_COUNTERSTEERING defaults false and is a rarely-needed "just in case"
+-- override (the auto detector usually gets the counter-steer side right).
+-- INVERTED_TRANSFERS is untouched: a different layer (which physical transfer entity
+-- is left vs right, also driving reverse-bite gear targeting). The reverse-only
+-- steer flip (old INVERT_REVERSE_STEER) is dropped; reverse steers like forward.
+-- Steering side detection (0.18.2): transfer L/R discovery now prefers Base-local
+-- side positions instead of the main gearbox's local Y axis, so a rotated gearbox
+-- no longer forces the transfer-side invert on most dupes. Single dual-clutch
+-- gearboxes also infer whether the gearbox's Left/Right driveshaft attachments
+-- are physically swapped on the Base, then auto-apply that polarity to brake
+-- steer and counter-steer. The manual INVERT_STEERING / INVERT_COUNTERSTEERING
+-- knobs (see 0.18.3) remain as overrides when a weird chassis is still crossed.
 -- Perf (0.18.1): cut the steady-state per-tick cost (~300us -> target sub-100us).
 -- The per-tick drivetrain checks no longer call the ACF type predicates
 -- (acfIsEngine/acfIsGearbox -- each a sandboxed ACF call that re-runs IsACFEntity
@@ -53,8 +115,12 @@ wire output is required.
 Drive convention (applied in both neutral-steer and brake-steer branches):
   A / left  -> brake / disengage the LEFT side.
   D / right -> brake / disengage the RIGHT side.
-If a vehicle is wired backwards, flip INVERT_BRAKE_STEER (brake-steer chassis)
-or INVERT_COUNTERSTEER (yaw correction) to swap that branch's polarity.
+The chip auto-detects the physical side of transfers and dual-clutch outputs
+from Base-local positions. If A/D driver steering comes out backwards on a given
+chassis, flip INVERT_STEERING. The yaw auto-correction has its own independent
+"just in case" INVERT_COUNTERSTEERING knob (you should rarely need it, since the
+detector handles its side). Flip INVERTED_TRANSFERS only if the auto transfer-side
+guess itself is wrong.
 ]]--
 
 require("allylib/simple_wire_helper.txt")
@@ -87,36 +153,37 @@ IDLE_THROTTLE     = 20
 MAX_BRAKE_POWER  = 100
 SCALE_BRAKES     = false
 BRAKE_SPEED_GATE = 50      -- km/h
-MAX_YAW_RATE     = 240
 
 HAS_WHEELS                   = false
 DISABLE_NEUTRAL_STEER        = false
-INVERTED_TRANSFERS           = true   -- physical L/R transfer layout on the gearbox
-INVERT_BRAKE_STEER           = true   -- chassis is wired so default A/D feels swapped
-INVERT_COUNTERSTEER          = true   -- swap counter-steer side
-INVERT_REVERSE_STEER         = false  -- swap steer direction while reversing
-INLINE_TRANSFERS             = true   -- transfers expose one "Gear" field (stock ACF)
+AUTO_DETECT_STEERING_SIDE    = true   -- infer physical L/R sides from Base-local positions
+INVERTED_TRANSFERS           = false  -- manual transfer-side override after auto-detect/fallback
+INVERT_STEERING              = true   -- flip if A/D driver steering responds the wrong way
 
--- Counter-steer only runs when driving straight (throttle, no steering input).
-YAW_DEADZONE           = 20
-COUNTERSTEER_STRENGTH  = 2     -- P gain
-COUNTERSTEER_KI        = 0     -- I gain
-COUNTERSTEER_KD        = 0.05  -- D gain (helps damp without windup)
-COUNTERSTEER_MIN_BRAKE = MAX_BRAKE_POWER / 2
+-- Counter-steer only runs when driving straight (throttle, no steering input): it
+-- damps the hull's yaw RATE so the rig tracks straight -- reactive, no course memory.
+--
+-- SELF-CALIBRATING / general across rigs: the chip MEASURES each vehicle's natural
+-- yaw-noise floor and active yaw range live (CounterSteerNoiseFloor / YawScale,
+-- updated inside applyCounterSteer) and DERIVES the deadzone and full-authority yaw
+-- from them, so there are NO per-vehicle yaw magnitudes (deg/s) to tune -- the same
+-- chip suits a light buggy and a heavy tank. The knobs below are dimensionless
+-- shape/strength ratios and filter time constants (seconds); both are rig-independent.
+--
+-- Small-jerk rejection: the raw yaw rate is LOW-PASSED (COUNTERSTEER_YAW_TAU) before
+-- anything else, so a brief spike from a bump/graze/terrain-clip is attenuated instead
+-- of slamming a track. The predictive lead is computed from the SMOOTHED rate and
+-- clamped to one deadzone, so a transient can't shove a quiet hull past the threshold.
+COUNTERSTEER_STRENGTH        = 1.0   -- overall response gain (dimensionless)
+COUNTERSTEER_KD              = 0.1   -- derivative damping (dimensionless)
+COUNTERSTEER_YAW_TAU         = 0.20  -- yaw-rate low-pass time constant (s); higher = more jerk rejection, more lag
+COUNTERSTEER_LOOKAHEAD       = 0.15  -- predictive lead (s) on the smoothed rate; 0 = purely reactive
+COUNTERSTEER_DEADZONE_MARGIN = 2.5   -- deadzone = measured noise floor * this (ignore wobble/jerks below it)
+COUNTERSTEER_SPAN_RATIO      = 4.0   -- until a bigger slew is seen, brake saturates near deadzone * this
+COUNTERSTEER_WINDOW          = 1.0   -- seconds of active correction AFTER the driver releases A/D; 0 = never auto-correct. Calibration keeps running outside the window; plain straight cruising with no recent steer never counter-steers (kills the high-speed limit cycle).
 
--- Predictive lead: project the hull's yaw rate COUNTERSTEER_LOOKAHEAD seconds
--- ahead (using EMA-smoothed yaw acceleration) and correct on that predicted
--- value, so the brake leads the slew instead of chasing it. A purely reactive
--- PID always trails the actual drift; the lookahead lets it pre-empt overshoot
--- and catch a yaw that is still building before it crosses the deadzone.
--- ACCEL_SMOOTH is the EMA factor on yaw acceleration (1 = raw/no smoothing,
--- lower = smoother but laggier) and tames single-tick noise at the 10 Hz tick.
--- Set LOOKAHEAD = 0 to fall back to the old reactive behavior exactly.
-COUNTERSTEER_LOOKAHEAD    = 0.15
-COUNTERSTEER_ACCEL_SMOOTH = 0.5
-
--- "Reverse bite": once counter-steer PID saturates, flip a transfer-side into
--- reverse for a harder bite. THRESHOLD of 1 disables it; 0 always engages.
+-- "Reverse bite": once the correction saturates, flip a transfer-side into reverse for
+-- a harder bite. THRESHOLD of 1 disables it; 0 always engages once correcting.
 ACTUAL_COUNTERSTEER_THRESHOLD  = 0.5
 ACTUAL_COUNTERSTEER_ENGAGEMENT = 1.0
 
@@ -139,6 +206,28 @@ REVERSE_TRANSFER_GEAR = 2
 -- Safety bound on the recursive drivetrain walk. The visited-set already prevents
 -- cycles; this just caps pathologically deep link graphs.
 MAX_DRIVETRAIN_DEPTH  = 16
+SIDE_DETECT_EPSILON   = 1 -- GU; side split must be clearer than this to trust it
+INVERT_COUNTERSTEERING       = false  -- "just in case" flip for the yaw auto-correction side
+INLINE_TRANSFERS             = true   -- transfers expose one "Gear" field (stock ACF)
+
+----------------------------------------------------------------------
+-- Counter-steer filter coefficients (derived, don't tune)
+-- csAlpha turns a time constant (seconds) into the EMA factor for the fixed THINK_DT
+-- tick. These are properties of the FILTERS, not per-rig tuning: the yaw low-pass and
+-- accel smoothing reject jerks; the noise floor falls fast / rises slow so an
+-- occasional slew can't inflate it; the yaw scale rises fast / falls slow so it tracks
+-- the rig's real slew magnitude. The deadzone and response scale are then DERIVED from
+-- those two measured envelopes (see applyCounterSteer).
+----------------------------------------------------------------------
+local function csAlpha(tau) return THINK_DT / (tau + THINK_DT) end
+local CS_YAW_ALPHA        = csAlpha(COUNTERSTEER_YAW_TAU)
+local CS_ACCEL_ALPHA      = csAlpha(0.30)
+local CS_NOISE_FALL_ALPHA = csAlpha(1.0)   -- floor drops quickly toward a quiet sample
+local CS_NOISE_RISE_ALPHA = csAlpha(8.0)   -- ...but climbs slowly, so a slew can't inflate it
+local CS_SCALE_RISE_ALPHA = csAlpha(0.30)  -- scale jumps up on a real slew
+local CS_SCALE_FALL_ALPHA = csAlpha(3.0)   -- ...and decays slowly back toward the floor
+local CS_WARM_ALPHA       = csAlpha(0.30)  -- fast symmetric tracking during the warmup window
+local CS_WARMUP_TICKS     = 15             -- straight-driving ticks (~1.5s) to calibrate before correcting
 
 ----------------------------------------------------------------------
 -- Mutable state
@@ -165,6 +254,7 @@ GearCount, ReverseGears       = 0, 0
 IsAutogearing                 = false
 CanNeutralSteer               = false
 DetectedDualClutch            = false
+AutoSteerInvert               = false
 
 OutputGearSlot                = 1
 OutputGear                    = 1
@@ -173,14 +263,20 @@ OutputLeftGear, OutputRightGear     = FORWARD_TRANSFER_GEAR, FORWARD_TRANSFER_GE
 OutputLeftClutch, OutputRightClutch = CLUTCH_FULL, CLUTCH_FULL
 OutputLeftBrake, OutputRightBrake   = MAX_BRAKE_POWER, MAX_BRAKE_POWER
 
-CounterSteerI         = 0
-CounterSteerPrevError = 0
-CounterSteerPrevYaw   = 0     -- last tick's signed yaw rate, for accel estimate
-CounterSteerYawAccel  = 0     -- EMA-smoothed yaw acceleration (deg/s^2)
-CounterSteerWarm      = false -- false until we have a prior yaw sample to diff
+CounterSteerYawF       = 0     -- EMA low-passed yaw rate (deg/s); rejects small jerks
+CounterSteerPrevYawF   = 0     -- last tick's smoothed yaw, for accel from the smoothed signal
+CounterSteerYawAccel   = 0     -- EMA-smoothed yaw acceleration (deg/s^2)
+CounterSteerPrevError  = 0     -- last tick's |error| above the deadzone, for the D term
+CounterSteerNoiseFloor = 0     -- MEASURED quiet-drive |yaw| floor -> auto deadzone basis
+CounterSteerYawScale   = 0     -- MEASURED active |yaw| range -> auto normalization basis
+CounterSteerSamples    = 0     -- straight-drive ticks counted toward calibration warmup
+CounterSteerWarm       = false -- false until a prior smoothed-yaw sample exists this engagement
+CounterSteerWindow     = 0     -- seconds of active-correction remaining; armed to COUNTERSTEER_WINDOW while steering, counts down once A/D is released
 
 EngineStateDirty = true
-inputClk("MainGearbox", function() EngineStateDirty = true end)
+local function markDrivetrainDirty() EngineStateDirty = true end
+inputClk("MainGearbox", markDrivetrainDirty)
+inputClk("Base", markDrivetrainDirty)
 
 local PrevMainGearbox = nil
 
@@ -395,6 +491,30 @@ local function gearboxCurrentRatio(ent)
     return math.abs(r)
 end
 
+local function attachmentWorldPos(ent, name)
+    local idx = ent:lookupAttachment(name) or 0
+    if idx <= 0 then return nil end
+
+    local att = ent:getAttachment(idx)
+    if not att then return nil end
+    if att.Pos then return att.Pos end
+    if att.x then return att end
+    if att[1] then return Vector(att[1], att[2], att[3]) end
+    return nil
+end
+
+local function hasAutoSideBase()
+    return AUTO_DETECT_STEERING_SIDE and isInputEntity(Base)
+end
+
+local function baseSideY(pos)
+    return Base:worldToLocal(pos).y
+end
+
+local function swapTransfers()
+    LeftTransfer, RightTransfer = RightTransfer, LeftTransfer
+end
+
 ----------------------------------------------------------------------
 -- Engine bookkeeping
 ----------------------------------------------------------------------
@@ -555,7 +675,12 @@ local function resetDrivetrainState()
     EngineUpstreamRatio         = nil
     CanNeutralSteer             = false
     DetectedDualClutch          = false
+    AutoSteerInvert             = false
     EngineReady                 = false
+    -- Drop per-rig counter-steer calibration so a new build/relink recalibrates its
+    -- own yaw-noise floor and slew range instead of inheriting the previous drivetrain's.
+    CounterSteerNoiseFloor, CounterSteerYawScale = 0, 0
+    CounterSteerSamples         = 0
     GearCount, ReverseGears     = 0, 0
     PrevWrittenGear             = nil
     clearArray(Engines)
@@ -578,20 +703,82 @@ local function resetDrivetrainState()
     clearArray(ReverseGearSpeeds)
 end
 
+local function assignTransfersByBaseSide(transferLinks, transfers)
+    if not hasAutoSideBase() or transfers < 2 then return false end
+
+    local avg = 0
+    for i = 1, transfers do
+        avg = avg + baseSideY(transferLinks[i]:getPos())
+    end
+    avg = avg / transfers
+
+    local leftY, rightY = SIDE_DETECT_EPSILON, -SIDE_DETECT_EPSILON
+    local left, right = nil, nil
+    for i = 1, transfers do
+        local link = transferLinks[i]
+        local sideY = baseSideY(link:getPos()) - avg
+        if sideY > leftY then
+            leftY = sideY
+            left = link
+        end
+        if sideY < rightY then
+            rightY = sideY
+            right = link
+        end
+    end
+
+    if not left or not right then return false end
+    LeftTransfer, RightTransfer = left, right
+    return true
+end
+
+local function assignTransfersByGearboxSide(transferLinks, transfers)
+    for i = 1, transfers do
+        local link = transferLinks[i]
+        local y = MainGearbox:worldToLocal(link:getPos()).y
+        if y < -SIDE_DETECT_EPSILON then RightTransfer = link end
+        if y > SIDE_DETECT_EPSILON then LeftTransfer  = link end
+    end
+end
+
 local function findTransfers(gearLinks)
     local transfers = 0
+    local transferLinks = {}
     for i = 1, #gearLinks do
         local link = gearLinks[i]
         if isTransferCase(link) then
             transfers = transfers + 1
-            local y = MainGearbox:worldToLocal(link:getPos()).y
-            if INVERTED_TRANSFERS then y = -y end
-            if y < 0 then RightTransfer = link end
-            if y > 0 then LeftTransfer  = link end
+            transferLinks[transfers] = link
             if transfers == 1 then TransferRatio = gearboxTotalRatio(link, 1) end
         end
     end
+
+    if transfers >= 2 then
+        if not assignTransfersByBaseSide(transferLinks, transfers) then
+            assignTransfersByGearboxSide(transferLinks, transfers)
+        end
+        if INVERTED_TRANSFERS then swapTransfers() end
+    end
+
     return transfers
+end
+
+local function detectDualClutchSteerSide()
+    AutoSteerInvert = false
+    if not hasAutoSideBase() then return end
+
+    local leftPos = attachmentWorldPos(MainGearbox, "driveshaftL")
+    local rightPos = attachmentWorldPos(MainGearbox, "driveshaftR")
+    if not leftPos or not rightPos then return end
+
+    local leftY = baseSideY(leftPos)
+    local rightY = baseSideY(rightPos)
+    if math.abs(leftY - rightY) <= SIDE_DETECT_EPSILON then return end
+
+    -- Base-local +Y is the vehicle's left side. If the gearbox's Left output is
+    -- physically right of its Right output, A/D steering and yaw correction need
+    -- the same side swap that users previously set manually on most rotated dupes.
+    AutoSteerInvert = leftY < rightY
 end
 
 local function buildGearSchedules()
@@ -668,6 +855,7 @@ local function updateEngineVariables()
 
     CanNeutralSteer    = transfers >= 2 and LeftWL ~= nil and RightWL ~= nil
     DetectedDualClutch = not CanNeutralSteer and isDualClutch(MainGearbox)
+    if DetectedDualClutch then detectDualClutchSteerSide() end
     EngineReady        = MainWL ~= nil and enginesReady() and PowerMax > 0
         and GearCount > 0 and (transfers < 2 or CanNeutralSteer)
 end
@@ -675,13 +863,16 @@ end
 ----------------------------------------------------------------------
 -- Per-tick output stages
 ----------------------------------------------------------------------
--- Clear all counter-steer PID + prediction state. Dropping CounterSteerWarm
--- forces the next engaged tick to seed accel at 0, so a stale CounterSteerPrevYaw
--- from before a steer/coast gap can't fabricate a huge yaw-acceleration spike.
+-- Clear per-engagement counter-steer state only. The low-pass reseeds from the raw
+-- rate on the next engaged tick (CounterSteerWarm = false), so a stale yaw from before
+-- a steer/coast gap can't inject a spike. NoiseFloor / YawScale / Samples are per-rig
+-- CALIBRATION and intentionally PERSIST across steer/coast gaps -- only a drivetrain
+-- refresh (resetDrivetrainState) clears them.
 local function resetCounterSteer()
-    CounterSteerI, CounterSteerPrevError      = 0, 0
-    CounterSteerPrevYaw, CounterSteerYawAccel = 0, 0
-    CounterSteerWarm                          = false
+    CounterSteerYawF, CounterSteerPrevYawF = 0, 0
+    CounterSteerYawAccel                   = 0
+    CounterSteerPrevError                  = 0
+    CounterSteerWarm                       = false
 end
 
 local function applyFailClosed()
@@ -742,6 +933,15 @@ local function chooseGearSlot(driveDir, speed, neutralSteer)
 end
 
 local function applyNeutralSteer(driveDir, steerDir, brakePower, hasDrive, hasSteer)
+    -- A/D driver-steering flip. Inverting steerDir at the source flips both the
+    -- pivot spin direction and the braked side together, so A/D respond the other
+    -- way consistently. This is independent of INVERT_COUNTERSTEERING (the yaw
+    -- auto-correction side), so fixing backwards A/D never disturbs a counter-steer
+    -- that already works. (Neutral steer's physical side comes from the transfer
+    -- assignment, so it does not consult AutoSteerInvert -- that is the dual-clutch/
+    -- brake-steer path; INVERTED_TRANSFERS is the transfer-side fix.)
+    if INVERT_STEERING then steerDir = -steerDir end
+
     if not hasDrive and hasSteer then
         -- Pure pivot: opposite transfer gears spin tracks in opposite directions.
         if steerDir < 0 then
@@ -777,47 +977,112 @@ local function applyBrakeSteer(driveDir, steerDir, brakePower, hasDrive, hasStee
     if not canSteerThisTick then return end
 
     local turnDir = steerDir
-    if driveDir < 0 and INVERT_REVERSE_STEER then turnDir = -turnDir end
-    if INVERT_BRAKE_STEER then turnDir = -turnDir end
+    if AutoSteerInvert ~= INVERT_STEERING then turnDir = -turnDir end
 
     addTurnBrake(turnDir, brakePower, CLUTCH_FULL)
 end
 
-local function applyCounterSteer(driveDir, brakePower)
+local function applyCounterSteer(driveDir, brakePower, applyBrake)
     local yawRate = Base:getAngleVelocity().z
 
-    -- Predict the yaw rate COUNTERSTEER_LOOKAHEAD seconds ahead and run the
-    -- whole corrector (magnitude AND side) on that instead of the raw current
-    -- rate. Estimate yaw acceleration from the last sample, EMA-smooth it to
-    -- tame 10 Hz tick noise, then extrapolate. On the first engaged tick we
-    -- have no prior sample, so accel is forced to 0 -- otherwise a stale
-    -- CounterSteerPrevYaw from before a steer/coast gap would inject a bogus
-    -- spike. LOOKAHEAD = 0 collapses yawPredicted back to yawRate exactly.
-    local rawAccel = CounterSteerWarm and (yawRate - CounterSteerPrevYaw) / THINK_DT or 0
-    CounterSteerWarm     = true
-    CounterSteerYawAccel = CounterSteerYawAccel
-        + (rawAccel - CounterSteerYawAccel) * COUNTERSTEER_ACCEL_SMOOTH
-    CounterSteerPrevYaw  = yawRate
+    -- 1) Low-pass the yaw RATE. A "small jerk" (bump, graze, terrain clip) is a brief
+    -- high-magnitude yaw spike; the EMA attenuates it while passing a sustained slew.
+    -- Seed from the raw rate on the first engaged tick so the filter doesn't lag in
+    -- from 0 after every steer/coast gap.
+    if not CounterSteerWarm then
+        CounterSteerYawF     = yawRate
+        CounterSteerPrevYawF = yawRate
+        CounterSteerYawAccel = 0
+        CounterSteerWarm     = true
+    else
+        CounterSteerYawF = CounterSteerYawF + (yawRate - CounterSteerYawF) * CS_YAW_ALPHA
+    end
 
-    local yawPredicted = yawRate + CounterSteerYawAccel * COUNTERSTEER_LOOKAHEAD
-    local yawAbs       = math.abs(yawPredicted)
+    -- 2) Yaw acceleration from the SMOOTHED rate (not the raw rate), so a jerk the
+    -- low-pass already rejected can't reappear as a huge acceleration spike.
+    local rawAccel = (CounterSteerYawF - CounterSteerPrevYawF) / THINK_DT
+    CounterSteerPrevYawF = CounterSteerYawF
+    CounterSteerYawAccel = CounterSteerYawAccel + (rawAccel - CounterSteerYawAccel) * CS_ACCEL_ALPHA
 
-    if yawAbs <= YAW_DEADZONE then
-        CounterSteerI, CounterSteerPrevError = 0, 0
+    local mag = math.abs(CounterSteerYawF)
+
+    -- 3) Live per-rig calibration, measured while driving straight (exactly when this
+    -- runs). A short warmup tracks both envelopes fast & symmetric so they reach the
+    -- rig's ballpark before we ever brake; afterwards the noise floor falls fast / rises
+    -- slow (sits at the quiet wobble level, not inflated by a slew) and the yaw scale
+    -- rises fast / falls slow (tracks how hard the rig actually slews).
+    if CounterSteerSamples < CS_WARMUP_TICKS then
+        CounterSteerSamples    = CounterSteerSamples + 1
+        CounterSteerNoiseFloor = CounterSteerNoiseFloor + (mag - CounterSteerNoiseFloor) * CS_WARM_ALPHA
+        CounterSteerYawScale   = CounterSteerYawScale   + (mag - CounterSteerYawScale)   * CS_WARM_ALPHA
+        CounterSteerPrevError  = 0
+        return  -- don't correct on a cold, un-calibrated estimate
+    end
+
+    if mag < CounterSteerNoiseFloor then
+        CounterSteerNoiseFloor = CounterSteerNoiseFloor + (mag - CounterSteerNoiseFloor) * CS_NOISE_FALL_ALPHA
+    else
+        CounterSteerNoiseFloor = CounterSteerNoiseFloor + (mag - CounterSteerNoiseFloor) * CS_NOISE_RISE_ALPHA
+    end
+    if mag > CounterSteerYawScale then
+        CounterSteerYawScale = CounterSteerYawScale + (mag - CounterSteerYawScale) * CS_SCALE_RISE_ALPHA
+    else
+        CounterSteerYawScale = CounterSteerYawScale + (mag - CounterSteerYawScale) * CS_SCALE_FALL_ALPHA
+    end
+
+    -- Outside the post-steer active window: the calibration above (yaw smoothing, accel,
+    -- warmup, noise/scale envelopes) still runs so the next A/D release is ready, but we
+    -- apply NO brake. This is what limits auto-correction to COUNTERSTEER_WINDOW seconds
+    -- after the driver lets go of A/D, so steady straight cruising can't pump a limit cycle.
+    if not applyBrake then
+        CounterSteerPrevError = 0
         return
     end
 
-    CounterSteerI = CounterSteerI + yawAbs * THINK_DT
-    local pidNorm = clampValue(
-        (yawAbs / MAX_YAW_RATE) * COUNTERSTEER_STRENGTH
-        + (CounterSteerI / MAX_YAW_RATE) * COUNTERSTEER_KI
-        + ((yawAbs - CounterSteerPrevError) / THINK_DT / MAX_YAW_RATE) * COUNTERSTEER_KD,
-        0, 1)
-    CounterSteerPrevError = yawAbs
+    -- 4) Derive the deadzone and full-authority yaw from the measured envelopes -- no
+    -- per-vehicle yaw magnitudes. normRef is the yaw at which the brake reaches full
+    -- authority (with STRENGTH = 1): whichever is larger, the rig's observed slew range
+    -- or deadzone*SPAN so a rig that hasn't shown a big slew yet still ramps over a
+    -- sensible span. The trailing 1 is purely a divide-by-zero guard, not a tuning value.
+    local deadzone = CounterSteerNoiseFloor * COUNTERSTEER_DEADZONE_MARGIN
+    local normRef  = math.max(CounterSteerYawScale, deadzone * COUNTERSTEER_SPAN_RATIO, 1)
 
-    local correctionBrake = math.min(
-        math.max(COUNTERSTEER_MIN_BRAKE, pidNorm * brakePower),
-        brakePower)
+    -- 5) Tamed predictive lead: anticipate the slew but clamp the feedforward to one
+    -- deadzone so a transient acceleration can never push a quiet hull past threshold.
+    local lead         = clampValue(CounterSteerYawAccel * COUNTERSTEER_LOOKAHEAD, -deadzone, deadzone)
+    local yawPredicted = CounterSteerYawF + lead
+    local yawAbs       = math.abs(yawPredicted)
+
+    if yawAbs <= deadzone then
+        CounterSteerPrevError = 0
+        return
+    end
+
+    -- 5b) Brake-to-arrest: a track brake can only DECELERATE the hull's spin -- held past
+    -- the point the spin would coast back to straight on its own, it powers the hull
+    -- THROUGH straight to the other side, which is what pumps the left/right wobble at
+    -- speed (subtle -> a lot) and bleeds forward speed via the constant alternating brake.
+    -- If the yaw is already decelerating fast enough to reach straight within the lookahead,
+    -- RELEASE and let momentum carry it in. Uses the unclamped predicted arrest (yaw and
+    -- yaw-accel opposing, |accel|*lookahead covering the current rate) so it triggers even
+    -- mid-slew, unlike the jerk-clamped magnitude path above. Raising COUNTERSTEER_LOOKAHEAD
+    -- releases earlier (calmer); lowering it holds the brake closer to straight (tighter).
+    if CounterSteerYawAccel * CounterSteerYawF < 0
+        and math.abs(CounterSteerYawAccel) * COUNTERSTEER_LOOKAHEAD >= mag then
+        CounterSteerPrevError = 0
+        return
+    end
+
+    -- 6) Proportional response ramps from 0 AT the deadzone up to full at normRef (no
+    -- step at the boundary), plus a derivative term that damps without windup.
+    local errAbs  = yawAbs - deadzone
+    local span    = normRef - deadzone
+    local pNorm   = span > 0 and (errAbs / span) or 1
+    local dNorm   = ((errAbs - CounterSteerPrevError) / THINK_DT) / normRef
+    local pidNorm = clampValue(pNorm * COUNTERSTEER_STRENGTH + dNorm * COUNTERSTEER_KD, 0, 1)
+    CounterSteerPrevError = errAbs
+
+    local correctionBrake = pidNorm * brakePower
 
     local reverseBiteActive = false
     if CanNeutralSteer
@@ -829,8 +1094,13 @@ local function applyCounterSteer(driveDir, brakePower)
         reverseBiteActive = biteAmount > 0
     end
 
-    local yawWhileDriving = yawPredicted * driveDir
-    if INVERT_COUNTERSTEER then yawWhileDriving = -yawWhileDriving end
+    -- Side from the CURRENT smoothed rate, NOT the predicted value: letting the lookahead
+    -- choose the side lets it flip sign near a zero-crossing and brake the WRONG track,
+    -- which adds spin energy and pumps the oscillation. (Past the brake-to-arrest gate the
+    -- hull is worsening/steady, so the current rate and predicted share a sign anyway --
+    -- this only removes the destabilizing near-zero flip.)
+    local yawWhileDriving = CounterSteerYawF * driveDir
+    if AutoSteerInvert ~= INVERT_COUNTERSTEERING then yawWhileDriving = -yawWhileDriving end
 
     -- Match brake-steer convention: right correction uses right brake.
     if yawWhileDriving < 0 then
@@ -931,10 +1201,17 @@ local function mainLogic()
         applyBrakeSteer(driveDir, steerDir, brakePower, hasDrive, hasSteer, speed, steerOnlyDrive)
     end
 
-    -- 9) Straight-line yaw correction (tracked vehicles, driving, no steer input).
+    -- 9) Straight-line yaw correction (tracked vehicles, driving, no steer input), but
+    -- only for COUNTERSTEER_WINDOW seconds AFTER the driver releases A/D. While steering,
+    -- the window is held armed; on release it counts down and correction is live; once it
+    -- elapses the chip stops braking (calibration keeps running) so plain straight cruising
+    -- never pumps a high-speed limit cycle.
     if not HAS_WHEELS and hasDrive and not hasSteer then
-        applyCounterSteer(driveDir, brakePower)
+        local windowActive = CounterSteerWindow > 0
+        if windowActive then CounterSteerWindow = CounterSteerWindow - THINK_DT end
+        applyCounterSteer(driveDir, brakePower, windowActive)
     else
+        if hasSteer then CounterSteerWindow = COUNTERSTEER_WINDOW else CounterSteerWindow = 0 end
         resetCounterSteer()
     end
 

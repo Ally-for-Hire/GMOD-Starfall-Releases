@@ -228,13 +228,19 @@ local SeatBaseplateEnt
 local SeatBaseplateWirelink
 
 -- base: candidate ACF baseplate entity; self: the calling chip (never a seat).
--- Caches the baseplate wirelink so repeated resolves don't re-fetch it.
+-- Caches the baseplate wirelink so repeated resolves don't re-fetch it. Re-fetches
+-- when the cache is empty too (not only when `base` changes): getWirelink can return
+-- nil if the baseplate isn't wire-ready yet (e.g. mid dupe-paste). The old
+-- change-only guard latched that nil forever, so a baseplate-wired Chair resolved to
+-- nil permanently and only the chip owner (via an owner() fallback) could drive it.
 function resolveBaseplateSeat(base, self)
     if not isValid(base) or base == self or base:getClass() ~= "acf_baseplate" then return nil end
 
-    if base ~= SeatBaseplateEnt then
+    if base ~= SeatBaseplateEnt or not SeatBaseplateWirelink then
         SeatBaseplateEnt = base
-        local ok, wirelink = pcall(function() return base:getWirelink() end)
+        local fn = base.getWirelink
+        local ok, wirelink = false, nil
+        if type(fn) == "function" then ok, wirelink = pcall(fn, base) end
         SeatBaseplateWirelink = ok and wirelink or nil
     end
 
@@ -310,6 +316,15 @@ function canNetSendBits(name, payloadBits)
     return net.getBitsLeft() >= estimateNetBits(name, payloadBits)
 end
 
+local function tryNetSendBody(name, writer, recipient, unreliable)
+    net.start(name)
+    if writer ~= nil then
+        writer()
+    end
+
+    net.send(recipient, unreliable)
+end
+
 -- name: net message name
 -- writer: callback that writes payload fields
 -- recipient: optional target
@@ -320,14 +335,7 @@ function tryNetSend(name, writer, recipient, unreliable, payloadBits)
         return false, "budget"
     end
 
-    local ok, err = pcall(function()
-        net.start(name)
-        if writer ~= nil then
-            writer()
-        end
-
-        net.send(recipient, unreliable)
-    end)
+    local ok, err = pcall(tryNetSendBody, name, writer, recipient, unreliable)
 
     if not ok then
         pcall(net.abort)

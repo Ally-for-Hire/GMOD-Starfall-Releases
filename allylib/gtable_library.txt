@@ -1,4 +1,5 @@
 --@name GTABLE Library
+--@author Ally for Hire / Merydian9
 --@server
 
 --[[
@@ -211,6 +212,56 @@ local function pruneVersions(self, now)
     end
 end
 
+-- onRemote message handlers, dispatched via a per-instance table built in :new(), so a remote
+-- broadcast is one O(1) lookup instead of up to 6 sequential string compares on every live
+-- GTABLE instance (including instances of unrelated prefixes that previously failed all 6).
+local function h_establish(self, sender)
+    pcall(hook.runRemote, sender, self.authMessage, self:_buildSnapshot())
+end
+
+local function h_auth(self, sender, snapshot)
+    self.onNetwork = true
+    local changed = self:_mergeSnapshot(snapshot, "sync")
+    self:_markReady("sync")
+    if changed then notify(self, nil, nil, "sync") end
+end
+
+local function h_remove(self, sender, explicit, stamp)
+    self:_applyIncoming(explicit, nil, stamp, "remoteRemove")
+    if not self._ready then self:_markReady("remote") end
+    self.onNetwork = true
+end
+
+local function h_data(self, sender, key, value, stamp)
+    self:_applyIncoming(key, value, stamp, "remote")
+    if not self._ready then self:_markReady("remote") end
+    self.onNetwork = true
+end
+
+local function h_bulk(self, sender, payload, versions)
+    if versions == nil and type(payload) == "table" then
+        versions = payload.versions
+        payload = payload.values
+    end
+    local changed = false
+    for key, stamp in pairs(versions or {}) do
+        if self:_applyIncoming(key, (payload or {})[key], stamp, "remoteBulk") then
+            changed = true
+        end
+    end
+    if changed then notify(self, nil, nil, "remoteBulk") end
+    if not self._ready then self:_markReady("remote") end
+    self.onNetwork = true
+end
+
+local function h_clear(self, sender, stamp)
+    if self:_applyClear(stamp, "remoteClear") then
+        notify(self, nil, nil, "remoteClear")
+    end
+    if not self._ready then self:_markReady("remote") end
+    self.onNetwork = true
+end
+
 function GTABLE:new(prefix, opts)
     assert(type(prefix) == "string" and prefix ~= "", "GTABLE:new() expects a non-empty string prefix")
     opts = opts or {}
@@ -264,6 +315,15 @@ function GTABLE:new(prefix, opts)
     obj.dataUpdateMessage     = prefix .. "::DATA"
     obj.bulkDataUpdateMessage = prefix .. "::BULK"
     obj.clearMessage          = prefix .. "::CLEAR"
+
+    obj._handlers = {
+        [obj.establishMessage]      = h_establish,
+        [obj.authMessage]           = h_auth,
+        [obj.removeMessage]         = h_remove,
+        [obj.dataUpdateMessage]     = h_data,
+        [obj.bulkDataUpdateMessage] = h_bulk,
+        [obj.clearMessage]          = h_clear,
+    }
 
     GTABLE._registry[prefix] = obj
 
@@ -458,76 +518,8 @@ end
 
 function GTABLE:onRemote(sender, owner, message, ...)
     if sender == self._chip then return end
-
-    if message == self.establishMessage then
-        pcall(hook.runRemote, sender, self.authMessage, self:_buildSnapshot())
-        return
-    end
-
-    if message == self.authMessage then
-        local snapshot = ...
-        self.onNetwork = true
-        local changed = self:_mergeSnapshot(snapshot, "sync")
-        self:_markReady("sync")
-        if changed then
-            notify(self, nil, nil, "sync")
-        end
-        return
-    end
-
-    if message == self.removeMessage then
-        local explicit, stamp = ...
-        self:_applyIncoming(explicit, nil, stamp, "remoteRemove")
-        if not self._ready then
-            self:_markReady("remote")
-        end
-        self.onNetwork = true
-        return
-    end
-
-    if message == self.dataUpdateMessage then
-        local key, value, stamp = ...
-        self:_applyIncoming(key, value, stamp, "remote")
-        if not self._ready then
-            self:_markReady("remote")
-        end
-        self.onNetwork = true
-        return
-    end
-
-    if message == self.bulkDataUpdateMessage then
-        local payload, versions = ...
-        if versions == nil and type(payload) == "table" then
-            versions = payload.versions
-            payload = payload.values
-        end
-        local changed = false
-        for key, stamp in pairs(versions or {}) do
-            if self:_applyIncoming(key, (payload or {})[key], stamp, "remoteBulk") then
-                changed = true
-            end
-        end
-        if changed then
-            notify(self, nil, nil, "remoteBulk")
-        end
-        if not self._ready then
-            self:_markReady("remote")
-        end
-        self.onNetwork = true
-        return
-    end
-
-    if message == self.clearMessage then
-        local stamp = ...
-        if self:_applyClear(stamp, "remoteClear") then
-            notify(self, nil, nil, "remoteClear")
-        end
-        if not self._ready then
-            self:_markReady("remote")
-        end
-        self.onNetwork = true
-        return
-    end
+    local handler = self._handlers[message]
+    if handler then handler(self, sender, ...) end
 end
 
 function GTABLE:onRemove()

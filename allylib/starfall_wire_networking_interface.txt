@@ -53,6 +53,13 @@ local MAX_RECORDS_PER_FLUSH = 32
 local SNAPSHOT_RETRY_COUNT = 3
 local STATE_POLL_INTERVAL = 0.25
 local CONNECT_RETRY_INTERVAL = 0.5
+-- Slow keepalive re-announce AFTER the server has confirmed us (we've received at
+-- least one record). This heals a server/chip reload (which clears ConnectSendTargets)
+-- or a transient drop from the ready set without the client having to be reloaded --
+-- the previous code stopped announcing forever on the first locally-successful send,
+-- so a lost/early announce orphaned the client permanently (no StoredSeat -> camera
+-- never activates, HUDs stay stale). Tiny client->server packet, so a slow rate is fine.
+local CONNECT_HEARTBEAT_INTERVAL = 5
 local CurTime = timer.curtime
 local NET_BASE_BITS = 8 * 8
 local STRING_TERM_BITS = 8
@@ -313,7 +320,7 @@ end
 function inputProto:removeTrigger(idx)
     local list = InputTriggers[self.name]
     if not list or not list[idx] then return false end
-    table.remove(list, idx)
+    list[idx] = false
     return true
 end
 
@@ -368,7 +375,7 @@ end
 function netVarProto:removeTrigger(idx)
     local list = NetVarTriggers[self.name]
     if not list or not list[idx] then return false end
-    table.remove(list, idx)
+    list[idx] = false
     return true
 end
 
@@ -494,11 +501,15 @@ function networkTargetSet(target)
     return true
 end
 
+local function triggerError(err)
+    print("[SFWN] trigger error: ", err)
+end
+
 local function fireTriggers(list, value, name)
     if not list then return end
     for i = 1, #list do
         local fn = list[i]
-        xpcall(fn, function(err) print("[SFWN] trigger error: ", err) end, value, name)
+        if fn then xpcall(fn, triggerError, value, name) end
     end
 end
 
@@ -627,20 +638,19 @@ local function estimateRecordsBits(records)
     return bits
 end
 
-local function canSendRecords(records)
-    if net == nil or net.getBitsLeft == nil then return true end
-    return net.getBitsLeft() >= estimateRecordsBits(records)
+local function recordBudgetStatus(records)
+    if net == nil or net.getBitsLeft == nil then return true, 0, 0 end
+    local budget = net.getBitsLeft()
+    local estimate = estimateRecordsBits(records)
+    return budget >= estimate, estimate, budget
 end
 
 -- Warn (throttled) when a single send eats more than HALF the remaining net
 -- budget -- a heads-up that you are networking too much / too often before it
 -- starts dropping or stalling. Just a print; never blocks the send.
 local LastBudgetWarn = 0
-local function warnHeavySend(records)
-    if net == nil or net.getBitsLeft == nil then return end
-    local budget = net.getBitsLeft()
+local function warnHeavySendBits(estBits, budget)
     if budget <= 0 then return end
-    local estBits = estimateRecordsBits(records)
     if estBits * 2 <= budget then return end   -- under half the budget: fine
 
     local now = (timer and timer.realtime) and timer.realtime() or 0
@@ -649,6 +659,18 @@ local function warnHeavySend(records)
     print(string.format(
         "[SFWN] WARNING: net send is %d bits, over half the %d-bit budget -- reduce networked vars or raise their interval",
         estBits, budget))
+end
+
+local function returnError(err) return err end
+
+local function sendRecordsBody(records, target)
+    net.start(NET_MESSAGE)
+    net.writeUInt(#records, 16)
+    for i = 1, #records do
+        net.writeString(records[i][1])
+        writeValue(records[i][2])
+    end
+    if target == nil then net.send() else net.send(target) end
 end
 
 local function sendRecords(records, targetOverride)
@@ -663,18 +685,11 @@ local function sendRecords(records, targetOverride)
         target = t
     end
 
-    if not canSendRecords(records) then return false, "budget" end
-    warnHeavySend(records)
+    local budgetOk, estBits, budget = recordBudgetStatus(records)
+    if not budgetOk then return false, "budget" end
+    warnHeavySendBits(estBits, budget)
 
-    local ok, err = xpcall(function()
-        net.start(NET_MESSAGE)
-        net.writeUInt(#records, 16)
-        for i = 1, #records do
-            net.writeString(records[i][1])
-            writeValue(records[i][2])
-        end
-        if target == nil then net.send() else net.send(target) end
-    end, function(err) return err end)
+    local ok, err = xpcall(sendRecordsBody, returnError, records, target)
 
     if not ok then
         pcall(net.abort)
@@ -702,11 +717,26 @@ if SERVER then
     local WireSelf = wire.self()
     local DirtyOrder = {}
     local DirtyLookup = {}
+    local FlushRecords = {}
+    local FlushSentEntries = {}
+    local FlushTimerActive = false
+    local flush
+
+    local function clearArray(t)
+        for i = 1, #t do t[i] = nil end
+    end
+
+    local function ensureFlushTimer()
+        if FlushTimerActive then return end
+        FlushTimerActive = true
+        timer.create("SFWN_Flush", FLUSH_INTERVAL, 0, flush)
+    end
 
     local function markDirty(entry)
         if DirtyLookup[entry.name] then return end
         DirtyLookup[entry.name] = true
         DirtyOrder[#DirtyOrder + 1] = entry
+        ensureFlushTimer()
     end
 
     function addNetworkedVariable(name, interval)
@@ -750,35 +780,52 @@ if SERVER then
     end)
 
     -- Flush dirty netvars
-    local function flush()
-        if #DirtyOrder <= 0 then return end
+    flush = function()
+        local dirtyCount = #DirtyOrder
+        if dirtyCount <= 0 then
+            timer.remove("SFWN_Flush")
+            FlushTimerActive = false
+            return
+        end
+
         local now = CurTime()
-        local records, sentEntries, remaining = {}, {}, {}
-        for i = 1, #DirtyOrder do
+        local writeIndex = 0
+        clearArray(FlushRecords)
+        clearArray(FlushSentEntries)
+
+        for i = 1, dirtyCount do
             local entry = DirtyOrder[i]
             DirtyLookup[entry.name] = nil
             if entry.dirty and entry.enabled ~= false then
                 local interval = entry.interval or 0
                 local due = not entry.lastSent or interval <= 0 or (now - entry.lastSent) >= interval
-                if due and #records < MAX_RECORDS_PER_FLUSH then
+                if due and #FlushRecords < MAX_RECORDS_PER_FLUSH then
                     entry.dirty = false
                     entry.lastSent = now
-                    records[#records + 1] = { entry.name, entry.value }
-                    sentEntries[#sentEntries + 1] = entry
+                    local record = entry.record
+                    if not record then
+                        record = { entry.name, entry.value }
+                        entry.record = record
+                    else
+                        record[2] = entry.value
+                    end
+                    FlushRecords[#FlushRecords + 1] = record
+                    FlushSentEntries[#FlushSentEntries + 1] = entry
                 else
-                    remaining[#remaining + 1] = entry
+                    writeIndex = writeIndex + 1
+                    DirtyOrder[writeIndex] = entry
                     DirtyLookup[entry.name] = true
                 end
             end
         end
-        DirtyOrder = remaining
-        if #records <= 0 then return end
+        for i = writeIndex + 1, dirtyCount do DirtyOrder[i] = nil end
+        if #FlushRecords <= 0 then return end
 
-        local ok, reason = sendRecords(records)
+        local ok, reason = sendRecords(FlushRecords)
         if ok or reason ~= "budget" then return end
 
-        for i = 1, #sentEntries do
-            local entry = sentEntries[i]
+        for i = 1, #FlushSentEntries do
+            local entry = FlushSentEntries[i]
             entry.dirty = true
             entry.lastSent = nil
             if not DirtyLookup[entry.name] then
@@ -787,8 +834,6 @@ if SERVER then
             end
         end
     end
-
-    timer.create("SFWN_Flush", FLUSH_INTERVAL, 0, flush)
 
     -- State helpers
     local GUN_FIELDS = {
@@ -899,11 +944,26 @@ if SERVER then
         end
     end
 
+    local StatePollTimerActive = false
+    local function ensureStatePollTimer()
+        if StatePollTimerActive then return end
+        StatePollTimerActive = true
+        timer.create("SFWN_StatePoll", STATE_POLL_INTERVAL, 0, function()
+            for prefix, cfg in pairs(StateConfigs) do
+                local ent = resolveEntity(InputValues[prefix])
+                if cfg.kind == "gun" then pollGunState(prefix, ent, cfg.interval)
+                elseif cfg.kind == "prop" then pollPropState(prefix, ent, cfg.interval)
+                elseif cfg.kind == "custom" then pollCustomState(prefix, ent, cfg.interval) end
+            end
+        end)
+    end
+
     function addNetworkedGunState(prefix, interval, enableReloadTime)
         prefix = normalizePrefix(prefix, "Gun")
         registerStateFields(prefix, GUN_FIELDS, interval)
         if enableReloadTime then registerStateFields(prefix, GUN_RELOAD_FIELDS, interval) end
         StateConfigs[prefix] = { kind = "gun", interval = interval or STATE_POLL_INTERVAL, reload = enableReloadTime == true }
+        ensureStatePollTimer()
         return true
     end
 
@@ -911,6 +971,7 @@ if SERVER then
         prefix = normalizePrefix(prefix, "Prop")
         registerStateFields(prefix, PROP_FIELDS, interval)
         StateConfigs[prefix] = { kind = "prop", interval = interval or STATE_POLL_INTERVAL }
+        ensureStatePollTimer()
         return true
     end
 
@@ -927,6 +988,7 @@ if SERVER then
             end
         end
         StateConfigs[prefix] = { kind = "custom", interval = interval or STATE_POLL_INTERVAL, fields = fields }
+        if #fields > 0 then ensureStatePollTimer() end
         return #fields > 0
     end
 
@@ -935,6 +997,7 @@ if SERVER then
         if not StateConfigs[prefix] then
             StateConfigs[prefix] = { kind = "gun", interval = interval or STATE_POLL_INTERVAL }
         end
+        ensureStatePollTimer()
         pollGunState(prefix, resolveEntity(inputOrGun), interval)
         return true
     end
@@ -944,6 +1007,7 @@ if SERVER then
         if not StateConfigs[prefix] then
             StateConfigs[prefix] = { kind = "prop", interval = interval or STATE_POLL_INTERVAL }
         end
+        ensureStatePollTimer()
         pollPropState(prefix, resolveEntity(inputOrProp), interval)
         return true
     end
@@ -952,18 +1016,10 @@ if SERVER then
         prefix = normalizePrefix(prefix, "State")
         local cfg = StateConfigs[prefix]
         if not cfg or not cfg.fields then return false end
+        ensureStatePollTimer()
         pollCustomState(prefix, resolveEntity(inputOrEntity), interval)
         return true
     end
-
-    timer.create("SFWN_StatePoll", STATE_POLL_INTERVAL, 0, function()
-        for prefix, cfg in pairs(StateConfigs) do
-            local ent = resolveEntity(InputValues[prefix])
-            if cfg.kind == "gun" then pollGunState(prefix, ent, cfg.interval)
-            elseif cfg.kind == "prop" then pollPropState(prefix, ent, cfg.interval)
-            elseif cfg.kind == "custom" then pollCustomState(prefix, ent, cfg.interval) end
-        end
-    end)
 
     -- Connect-send
     local function sendSnapshotToPlayer(ply)
@@ -984,10 +1040,21 @@ if SERVER then
 
     net.receive(NET_MESSAGE, function(_, ply)
         pcall(net.readUInt, 16)
+        -- The client appends a "needSnapshot" bool: true on an unconfirmed/forced
+        -- announce, false on a confirmed keepalive. Re-snapshot when the player is new
+        -- to us (first announce, OR our targets were cleared by a reload) or when they
+        -- explicitly ask, but skip the full re-snapshot on a routine keepalive.
+        local okBool, needSnapshot = pcall(net.readBool)
+        if not okBool then needSnapshot = true end   -- pre-bool client: be safe
         if not ConnectSendEnabled or not validRecipient(ply) then return end
+        local isNew = not ConnectSendTargets[ply]
         ConnectSendTargets[ply] = true
-        sendSnapshotToPlayer(ply)
+        if isNew or needSnapshot then sendSnapshotToPlayer(ply) end
     end)
+
+    -- Server has no snapshot to request; client-only API, stubbed so shared chips
+    -- can call it in either realm without erroring.
+    function requestNetworkSnapshot() return false end
 
     hook.add("ClientInitialized", "SFWN_ClientInit", function(ply)
         if not ConnectSendEnabled then
@@ -1034,27 +1101,48 @@ if CLIENT then
     function updateNetworkedPropArmorState() return false end
     function updateStateSend() return false end
 
+    -- ConnectSendAnnounced now means "the server has CONFIRMED us" (we have received
+    -- at least one record), NOT merely "we fired a send". A local net.send succeeding
+    -- does not prove the server received it -- the old code stopped retrying on local
+    -- success, so a dropped/early announce (server chip mid-load, dupe paste, realm
+    -- ordering) left the client silently orphaned forever. Now the announce repeats
+    -- every CONNECT_RETRY_INTERVAL until confirmed, then drops to a slow keepalive that
+    -- heals a server reload / a transient drop from the ready set.
+    local NextAnnounce = 0
+
+    local function sendAnnounceBody(needSnapshot)
+        net.start(NET_MESSAGE)
+        net.writeUInt(0, 16)           -- count 0 == announce/keepalive
+        net.writeBool(needSnapshot)    -- needSnapshot while unconfirmed/forced
+        net.send()
+    end
+
+    local function sendAnnounce(forceSnapshot)
+        local ok = pcall(sendAnnounceBody, forceSnapshot == true or not ConnectSendAnnounced)
+        if not ok then pcall(net.abort) end
+    end
+
+    -- Force an immediate snapshot request (used by chips that detect they still lack a
+    -- needed netvar, e.g. the camera sitting in a seat with StoredSeat still defaulted).
+    function requestNetworkSnapshot()
+        if not ConnectSendEnabled then return false end
+        sendAnnounce(true)
+        return true
+    end
+
     function enableConnectSend(enabled)
         ConnectSendEnabled = enabled == true
-        if ConnectSendEnabled and not ConnectSendAnnounced then
-            timer.create("SFWN_Announce", CONNECT_RETRY_INTERVAL, 0, function()
-                if ConnectSendAnnounced then
-                    timer.remove("SFWN_Announce")
-                    return
-                end
-                local ok = pcall(function()
-                    net.start(NET_MESSAGE)
-                    net.writeUInt(0, 16)
-                    net.send()
-                end)
-                if ok then
-                    ConnectSendAnnounced = true
-                    timer.remove("SFWN_Announce")
-                else
-                    pcall(net.abort)
-                end
-            end)
-        end
+        if not ConnectSendEnabled then return ConnectSendEnabled end
+
+        NextAnnounce = 0
+        timer.create("SFWN_Announce", CONNECT_RETRY_INTERVAL, 0, function()
+            if not ConnectSendEnabled then return end
+            local now = (timer.realtime and timer.realtime()) or 0
+            -- Confirmed: only re-announce at the slow keepalive cadence.
+            if ConnectSendAnnounced and now < NextAnnounce then return end
+            sendAnnounce(false)
+            NextAnnounce = now + CONNECT_HEARTBEAT_INTERVAL
+        end)
         return ConnectSendEnabled
     end
 
@@ -1074,6 +1162,9 @@ if CLIENT then
     net.receive(NET_MESSAGE, function()
         local count = net.readUInt(16)
         if count == 0 then return end
+        -- Receiving records proves the server has us in its ready set: confirm so the
+        -- announce backs off to the slow keepalive instead of retrying every 0.5s.
+        ConnectSendAnnounced = true
         for i = 1, count do
             local name = net.readString()
             local value = readValue()
